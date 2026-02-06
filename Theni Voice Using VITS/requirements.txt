@@ -1,0 +1,10 @@
+TTS==0.22.0
+torch
+torchaudio
+numpy
+soundfile
+librosa
+ffmpeg-python
+pyyaml
+gradio
+pandas

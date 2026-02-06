@@ -1,0 +1,20 @@
+{
+  "model": "vits",
+  "batch_size": 16,
+  "epochs": 300,
+  "use_phonemes": true,
+  "phoneme_language": "ta",
+  "text_cleaner": "tamil_cleaners",
+  "audio": {
+    "sample_rate": 22050
+  },
+  "datasets": [
+    {
+      "name": "theni",
+      "path": "dataset",
+      "meta_file_train": "metadata.csv",
+      "meta_file_val": "metadata.csv",
+      "language": "ta"
+    }
+  ]
+}
