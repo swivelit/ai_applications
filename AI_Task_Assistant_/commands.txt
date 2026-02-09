@@ -1,0 +1,52 @@
+  #Schedule Meeting#
+
+Schedule a meeting with the team tomorrow at 10 AM
+Arrange a meeting with HR today at 3 PM
+Set up a meeting with the project team on Monday at 11 AM
+Schedule a call with the manager tomorrow at 4 PM
+Remind me to attend the meeting tomorrow at 10 AM
+Schedule meeting tomorrow 10 AM
+Please arrange a meeting with the project team tomorrow morning
+Set up a meeting with John and Alex tomorrow at 10 AM
+
+ #Reminder Commands#
+ Remind me to submit the assignment tomorrow at 9 AM
+Set a reminder to call my manager today at 5 PM
+Remind me to take medicine at 8 PM
+Remind me to pay the electricity bill tomorrow
+
+#Alarm / Time-Based Commands#
+Wake me up tomorrow at 6 AM
+Set an alarm for 7:30 AM
+Set a morning alarm at 5 AM
+Wake me up at 8 AM on Monday
+
+#To-Do / Task Management Commands#
+Add buy groceries to my to-do list
+Create a task to complete the AI project by Friday
+Add finish report to my tasks
+Create a task to clean the house today
+
+#General Assistant#
+Open calculator
+Increase the volume
+Turn on Bluetooth
+Enable WiFi
+
+#Information Request Commands#
+What is the weather today?
+Tell me the capital of France
+Who is the CEO of Google?
+What time is it now?
+
+#Communication Commands#
+Send a message to John saying I will be late
+Email the report to my manager
+Send a message to the team about the deadline
+Mail the invoice to the client
+
+#Note-Taking Commands#
+Take a note that the meeting was postponed
+Save a note saying client prefers email communication
+Note down project deadline is next Monday
+Add a note about budget approval
