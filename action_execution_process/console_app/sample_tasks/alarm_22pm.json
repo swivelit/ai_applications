@@ -3,7 +3,7 @@
   "app": "clock",
   "action": "set_alarm",
   "data": {
-    "time": "4:00",
+    "time": "10:00",
     "schedule_type": "one_time",
     "date": "2026-02-12",
     "repeat_days": [],
