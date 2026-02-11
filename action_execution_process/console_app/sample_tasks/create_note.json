@@ -1,0 +1,9 @@
+{
+  "request_id": "12345",
+  "app": "notes",
+  "action": "create_note",
+  "data": {
+    "title": "Meeting Notes",
+    "content": "Discuss project roadmap at 4 PM tomorrow"
+  }
+}
