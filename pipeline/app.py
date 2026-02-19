@@ -1,122 +1,264 @@
-from flask import Flask, request, render_template
+# -----------------------------------
+# Optimized Hybrid RAG + OpenAI LLM
+# SAFE VS CODE VERSION
+# -----------------------------------
+
+import time
+import logging
+import os
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+
 from deep_translator import GoogleTranslator
-import re
-import pyttsx3
-from task_engine import set_alarm, open_app, add_reminder
+from langdetect import detect
+from langdetect.lang_detect_exception import LangDetectException
 
-app = Flask(__name__)
+from sentence_transformers import SentenceTransformer
+from openai import OpenAI
+
 
 # -------------------------
-# TEXT TO SPEECH
+# LOAD ENV VARIABLES
 # -------------------------
-engine = pyttsx3.init()
 
-def speak(text):
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    raise ValueError("❌ OPENAI_API_KEY not found in .env file")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+
+# -------------------------
+# CONFIGURATION
+# -------------------------
+
+CSV_PATH = "voice_assistant_dataset_10000.csv"
+EMBEDDING_CACHE = "cached_embeddings.npy"
+
+HIGH_THRESHOLD = 0.85
+MEDIUM_THRESHOLD = 0.65
+TOP_K = 3
+
+
+# -------------------------
+# LOAD EMBEDDING MODEL
+# -------------------------
+
+print("🔄 Loading embedding model...")
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+print("✅ Embedding model loaded.\n")
+
+
+# -------------------------
+# LANGUAGE CONVERSION
+# -------------------------
+
+def convert_to_english(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    text = text.strip()
+
     try:
-        engine.say(text)
-        engine.runAndWait()
-    except:
-        pass
+        language = detect(text)
+    except LangDetectException:
+        return text
 
-# -------------------------
-# TRANSLATE TAMIL -> ENGLISH
-# -------------------------
-def translate_to_english(text):
     try:
-        return GoogleTranslator(source='auto', target='en').translate(text)
+        if language == "ta":
+            print("🌐 Translating Tamil → English")
+            return GoogleTranslator(source="ta", target="en").translate(text)
+        return text
     except:
         return text
 
-# -------------------------
-# EXTRACT TIME
-# -------------------------
-def extract_time(text):
-    match = re.search(r'(\d{1,2})(:(\d{2}))?\s*(am|pm)?', text, re.IGNORECASE)
-    if match:
-        hour = int(match.group(1))
-        minute = match.group(3)
-        am_pm = match.group(4)
-        if minute is None:
-            minute = "00"
-        if am_pm:
-            am_pm = am_pm.lower()
-            if am_pm == "pm" and hour < 12:
-                hour += 12
-            if am_pm == "am" and hour == 12:
-                hour = 0
-        return f"{hour:02d}:{minute}"
-    return None
 
 # -------------------------
-# INTENT DETECTION
+# LOAD DATASET
 # -------------------------
-def detect_intent(english_text):
-    text = english_text.lower()
-    if any(word in text for word in ["alarm", "wake", "remind"]):
-        return "set_alarm"
-    if any(word in text for word in ["open", "start", "launch"]):
-        return "open_app"
-    if any(word in text for word in ["reminder", "note", "remember"]):
-        return "add_reminder"
-    if any(word in text for word in ["hello", "hi", "வணக்கம்"]):
-        return "greeting"
-    return "unknown"
 
-# -------------------------
-# RESPONSE ENGINE
-# -------------------------
-def generate_response(intent, english_text):
+def load_dataset(csv_path: str):
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError("❌ CSV file not found.")
 
-    text = english_text.lower()
-
-    if intent == "set_alarm":
-        time_str = extract_time(text)
-        if time_str:
-            response = set_alarm(time_str)
-            speak(f"அலாரம் அமைக்கப்பட்டது {time_str} மணிக்கு")
-        else:
-            response = "Please specify time"
-            speak("நேரத்தை சொல்லுங்கள்")
-
-    elif intent == "open_app":
-        response = open_app(text)
-
-    elif intent == "add_reminder":
-        response = add_reminder(text)
-
-    elif intent == "greeting":
-        response = "Hello! How can I help you?"
-        speak("வணக்கம் நான் உங்களுக்கு உதவலாமா")
-
+    for encoding in ["utf-8", "utf-8-sig", "latin-1", "cp1252"]:
+        try:
+            df = pd.read_csv(csv_path, encoding=encoding)
+            print(f"✅ Loaded CSV using encoding: {encoding}")
+            break
+        except UnicodeDecodeError:
+            continue
     else:
-        response = "Command not understood"
-        speak("மன்னிக்கவும் புரியவில்லை")
+        raise ValueError("❌ Could not decode CSV file.")
 
-    return response
+    if "question" not in df.columns or "answer" not in df.columns:
+        raise ValueError("❌ CSV must contain 'question' and 'answer' columns.")
 
-# -------------------------
-# MAIN ROUTE
-# -------------------------
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    result = {}
-    if request.method == 'POST':
-        tamil_text = request.form['tamil']
-        english = translate_to_english(tamil_text)
-        normalized = english.lower()
-        intent = detect_intent(normalized)
-        response = generate_response(intent, normalized)
+    return df
 
-        result = {
-            "tamil": tamil_text,
-            "english": english,
-            "intent": intent,
-            "response": response
-        }
-    return render_template('index.html', result=result)
 
 # -------------------------
-# RUN SERVER
+# SAFE EMBEDDING LOADER
 # -------------------------
-if __name__ == '__main__':
-    app.run(debug=True)
+
+def create_or_load_embeddings(df):
+
+    # If cache exists → try loading safely
+    if os.path.exists(EMBEDDING_CACHE):
+        print("📦 Loading cached embeddings...")
+
+        try:
+            embeddings = np.load(EMBEDDING_CACHE)
+
+            # Validate shape
+            if embeddings.shape[0] != len(df):
+                print("⚠ Cache size mismatch. Rebuilding embeddings...")
+                raise ValueError("Shape mismatch")
+
+            print("✅ Cached embeddings loaded successfully.\n")
+            return embeddings
+
+        except Exception as e:
+            print(f"❌ Corrupted cache detected: {e}")
+            print("🗑 Deleting corrupted cache...")
+            os.remove(EMBEDDING_CACHE)
+            print("🔁 Regenerating embeddings...\n")
+
+    # Create new embeddings
+    print("⚡ Creating dataset embeddings (one-time process)...")
+
+    questions = df["question"].astype(str).tolist()
+
+    embeddings = embedding_model.encode(
+        questions,
+        normalize_embeddings=True,
+        show_progress_bar=True
+    )
+
+    np.save(EMBEDDING_CACHE, embeddings)
+    print("✅ Embeddings cached successfully.\n")
+
+    return embeddings
+
+
+# -------------------------
+# FAST SIMILARITY SEARCH
+# -------------------------
+
+def compute_similarity(query_embedding, embeddings):
+    return np.dot(embeddings, query_embedding)
+
+
+# -------------------------
+# LLM CALL
+# -------------------------
+
+def generate_with_llm(query: str, context: str = None):
+
+    llm_start = time.time()
+
+    if context:
+        system_prompt = (
+            "You are a helpful voice assistant. "
+            "Use the provided context only if relevant."
+        )
+
+        user_prompt = f"""
+Context:
+{context}
+
+Question:
+{query}
+"""
+    else:
+        system_prompt = "You are a helpful voice assistant."
+        user_prompt = query
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.5,
+    )
+
+    print(f"🧠 LLM time: {time.time() - llm_start:.2f}s")
+
+    return response.choices[0].message.content
+
+
+# -------------------------
+# HYBRID RAG PIPELINE
+# -------------------------
+
+def hybrid_rag_pipeline(query, df, embeddings):
+
+    rag_start = time.time()
+
+    query_embedding = embedding_model.encode(
+        [query],
+        normalize_embeddings=True
+    )[0]
+
+    similarities = compute_similarity(query_embedding, embeddings)
+
+    best_index = np.argmax(similarities)
+    best_score = similarities[best_index]
+
+    print(f"🔎 Similarity Score: {best_score:.4f}")
+
+    if best_score >= HIGH_THRESHOLD:
+        print("⚡ Direct RAG Answer")
+        print(f"⏱ RAG time: {time.time() - rag_start:.2f}s\n")
+        return df.iloc[best_index]["answer"]
+
+    if best_score < MEDIUM_THRESHOLD:
+        print("➡ Routing: Pure LLM\n")
+        print(f"⏱ RAG time: {time.time() - rag_start:.2f}s\n")
+        return generate_with_llm(query)
+
+    top_indices = similarities.argsort()[-TOP_K:][::-1]
+    context = "\n".join(df.iloc[i]["answer"] for i in top_indices)
+
+    print("➡ Routing: LLM + Context\n")
+    print(f"⏱ RAG time: {time.time() - rag_start:.2f}s\n")
+
+    return generate_with_llm(query, context)
+
+
+# -------------------------
+# MAIN LOOP
+# -------------------------
+
+def main():
+
+    df = load_dataset(CSV_PATH)
+    embeddings = create_or_load_embeddings(df)
+
+    while True:
+        user_input = input("\n🎤 Enter your query (or type 'exit'): ").strip()
+
+        if user_input.lower() == "exit":
+            print("👋 Exiting...")
+            break
+
+        english_query = convert_to_english(user_input)
+
+        total_start = time.time()
+
+        response = hybrid_rag_pipeline(english_query, df, embeddings)
+
+        print("\n💬 Final Response:\n")
+        print(response)
+
+        print(f"\n⏳ Total time: {time.time() - total_start:.2f}s")
+
+
+if __name__ == "__main__":
+    main()
