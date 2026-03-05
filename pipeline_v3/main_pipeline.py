@@ -7,8 +7,7 @@ from config import DEBUG, DEFAULT_USER_ID, LOGS_DIR
 from stage_behaviour_questions import BehaviourQuestionnaire
 from stage_english_remodel import EnglishRemodeler
 from stage_openai_core import OpenAICore
-from stage_tamil_translate import TamilTranslator
-from stage_theni_converter import TheniTamilConverter
+from stage_translate import StageTranslator
 
 
 class PersonaTamilPipeline:
@@ -17,16 +16,15 @@ class PersonaTamilPipeline:
         self.behaviour = BehaviourQuestionnaire()
         self.core = OpenAICore()
         self.remodeler = EnglishRemodeler(self.core)
-        self.translator = TamilTranslator(self.core)
-        self.theni_converter = TheniTamilConverter(self.core)
+        self.translator = StageTranslator(self.core)
         self.profile = self.behaviour.ensure_profile(user_id)
 
     def run(self, user_query: str) -> Dict[str, str]:
         profile_context = self.behaviour.build_runtime_context(self.profile)
         raw_english = self.core.answer_user_query(user_query, profile_context)
         remodeled_english = self.remodeler.remodel(user_query, raw_english, self.profile)
-        tamil_text = self.translator.translate(remodeled_english, self.profile)
-        theni_tamil_text = self.theni_converter.convert(tamil_text, self.profile)
+        tamil_text = self.translator.english_to_tamil(remodeled_english, self.profile)
+        theni_tamil_text = self.translator.tamil_to_thenitamil(tamil_text)
 
         result = {
             "raw_english": raw_english,
