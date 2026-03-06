@@ -20,7 +20,7 @@ class PersonaTamilPipeline:
         self.profile = self.behaviour.ensure_profile(user_id)
 
     def run(self, user_query: str) -> Dict[str, str]:
-        profile_context = self.behaviour.build_runtime_context(self.profile)
+        profile_context = self.behaviour.build_runtime_context(self.profile, user_query=user_query)
         raw_english = self.core.answer_user_query(user_query, profile_context)
         remodeled_english = self.remodeler.remodel(user_query, raw_english, self.profile)
         tamil_text = self.translator.english_to_tamil(remodeled_english, self.profile)
