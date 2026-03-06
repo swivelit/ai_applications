@@ -1,0 +1,361 @@
+{
+  "dataset_name": "personality_understanding_benchmark",
+  "question_count": 15,
+  "traits": [
+    "introverted",
+    "extroverted",
+    "disciplined",
+    "spontaneous",
+    "risk_taker",
+    "social",
+    "health_focused",
+    "active",
+    "calm_under_stress"
+  ],
+  "questions": [
+    {
+      "id": 1,
+      "question": "How do you usually spend your free time?",
+      "options": [
+        {
+          "answer": "Reading or watching movies alone",
+          "trait": "introverted"
+        },
+        {
+          "answer": "Meeting a few close friends",
+          "trait": "social"
+        },
+        {
+          "answer": "Going to parties or events",
+          "trait": "extroverted"
+        },
+        {
+          "answer": "Exploring hobbies or learning something new",
+          "trait": "disciplined"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "question": "How do you usually plan your day?",
+      "options": [
+        {
+          "answer": "I plan everything in advance",
+          "trait": "disciplined"
+        },
+        {
+          "answer": "I plan only important things",
+          "trait": "disciplined"
+        },
+        {
+          "answer": "I mostly go with the flow",
+          "trait": "spontaneous"
+        },
+        {
+          "answer": "I rarely plan anything",
+          "trait": "spontaneous"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "question": "When making decisions you usually:",
+      "options": [
+        {
+          "answer": "Choose the safest option",
+          "trait": "calm_under_stress"
+        },
+        {
+          "answer": "Take calculated risks",
+          "trait": "risk_taker"
+        },
+        {
+          "answer": "Follow your intuition",
+          "trait": "spontaneous"
+        },
+        {
+          "answer": "Ask others for advice",
+          "trait": "social"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "question": "How do you react when facing stress?",
+      "options": [
+        {
+          "answer": "Solve the problem immediately",
+          "trait": "calm_under_stress"
+        },
+        {
+          "answer": "Talk to someone",
+          "trait": "social"
+        },
+        {
+          "answer": "Take time alone",
+          "trait": "introverted"
+        },
+        {
+          "answer": "Distract yourself with entertainment",
+          "trait": "spontaneous"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "question": "How do you prefer learning new skills?",
+      "options": [
+        {
+          "answer": "Step-by-step instructions",
+          "trait": "disciplined"
+        },
+        {
+          "answer": "Hands-on practice",
+          "trait": "active"
+        },
+        {
+          "answer": "Watching tutorials",
+          "trait": "introverted"
+        },
+        {
+          "answer": "Learning in a group",
+          "trait": "social"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "question": "How often do you exercise?",
+      "options": [
+        {
+          "answer": "Almost every day",
+          "trait": "health_focused"
+        },
+        {
+          "answer": "3\u20134 times a week",
+          "trait": "active"
+        },
+        {
+          "answer": "Occasionally",
+          "trait": "spontaneous"
+        },
+        {
+          "answer": "Rarely",
+          "trait": "introverted"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "question": "How would you describe your sleep routine?",
+      "options": [
+        {
+          "answer": "Very consistent",
+          "trait": "disciplined"
+        },
+        {
+          "answer": "Mostly consistent",
+          "trait": "health_focused"
+        },
+        {
+          "answer": "Irregular",
+          "trait": "spontaneous"
+        },
+        {
+          "answer": "Very poor sleep",
+          "trait": "introverted"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "question": "After a busy week you prefer:",
+      "options": [
+        {
+          "answer": "Quiet time alone",
+          "trait": "introverted"
+        },
+        {
+          "answer": "Meeting friends",
+          "trait": "social"
+        },
+        {
+          "answer": "Going out to events",
+          "trait": "extroverted"
+        },
+        {
+          "answer": "Doing outdoor activities",
+          "trait": "active"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "question": "Which hobby interests you most?",
+      "options": [
+        {
+          "answer": "Sports or fitness",
+          "trait": "active"
+        },
+        {
+          "answer": "Reading or studying",
+          "trait": "introverted"
+        },
+        {
+          "answer": "Traveling",
+          "trait": "risk_taker"
+        },
+        {
+          "answer": "Gaming or entertainment",
+          "trait": "spontaneous"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "question": "How do you approach food choices?",
+      "options": [
+        {
+          "answer": "Strict healthy diet",
+          "trait": "health_focused"
+        },
+        {
+          "answer": "Mostly healthy",
+          "trait": "health_focused"
+        },
+        {
+          "answer": "Balanced",
+          "trait": "disciplined"
+        },
+        {
+          "answer": "Eat whatever I want",
+          "trait": "spontaneous"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "question": "When facing a challenge you:",
+      "options": [
+        {
+          "answer": "Analyze carefully",
+          "trait": "disciplined"
+        },
+        {
+          "answer": "Ask for help",
+          "trait": "social"
+        },
+        {
+          "answer": "Try different solutions quickly",
+          "trait": "risk_taker"
+        },
+        {
+          "answer": "Wait and see",
+          "trait": "spontaneous"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "question": "What motivates you the most?",
+      "options": [
+        {
+          "answer": "Achievement and success",
+          "trait": "disciplined"
+        },
+        {
+          "answer": "Helping others",
+          "trait": "social"
+        },
+        {
+          "answer": "Adventure and excitement",
+          "trait": "risk_taker"
+        },
+        {
+          "answer": "Comfort and stability",
+          "trait": "introverted"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "question": "How energetic do you feel daily?",
+      "options": [
+        {
+          "answer": "Very energetic",
+          "trait": "active"
+        },
+        {
+          "answer": "Moderately energetic",
+          "trait": "active"
+        },
+        {
+          "answer": "Low energy",
+          "trait": "introverted"
+        },
+        {
+          "answer": "Very tired often",
+          "trait": "health_focused"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "question": "Do you currently manage any health condition?",
+      "options": [
+        {
+          "answer": "No",
+          "trait": "active"
+        },
+        {
+          "answer": "Minor conditions",
+          "trait": "health_focused"
+        },
+        {
+          "answer": "Chronic condition",
+          "trait": "health_focused"
+        },
+        {
+          "answer": "Prefer not to say",
+          "trait": "introverted"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "question": "How would friends describe you?",
+      "options": [
+        {
+          "answer": "Calm and thoughtful",
+          "trait": "introverted"
+        },
+        {
+          "answer": "Friendly and outgoing",
+          "trait": "extroverted"
+        },
+        {
+          "answer": "Hardworking and disciplined",
+          "trait": "disciplined"
+        },
+        {
+          "answer": "Adventurous and spontaneous",
+          "trait": "risk_taker"
+        }
+      ]
+    }
+  ],
+  "sample_output": {
+    "trait_scores": {
+      "introverted": 4,
+      "extroverted": 2,
+      "disciplined": 5,
+      "spontaneous": 1,
+      "risk_taker": 2,
+      "social": 3,
+      "health_focused": 2,
+      "active": 3,
+      "calm_under_stress": 1
+    },
+    "personality_summary": "This person appears disciplined, moderately social, and somewhat introverted. They value structure, learning, and thoughtful decision-making."
+  }
+}
