@@ -4,7 +4,7 @@ import math
 import re
 import string
 import unicodedata
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,7 +13,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 
-from config import DATA_DIR, REMODEL_TEMPERATURE
+from config import REMODEL_TEMPERATURE
 from stage_openai_core import OpenAICore
 
 
@@ -26,6 +26,11 @@ class EmbeddedTextClassifier:
     """
     Trains a TF-IDF + Logistic Regression classifier
     from the local CSV dataset and predicts labels for text.
+
+    New behavior:
+    - supports a third column: 'answer'
+    - if an exact query match exists in the dataset, that stored answer
+      can be returned directly without generation
     """
 
     def __init__(self, dataset_path: Optional[str] = None) -> None:
@@ -40,6 +45,8 @@ class EmbeddedTextClassifier:
         self.train_accuracy: Optional[float] = None
         self.test_accuracy: Optional[float] = None
         self.label_distribution: Dict[str, int] = {}
+        self.raw_dataset: Optional[pd.DataFrame] = None
+        self.direct_answer_map: Dict[str, str] = {}
         self._train()
 
     def _resolve_dataset_path(self) -> str:
@@ -79,12 +86,29 @@ class EmbeddedTextClassifier:
                 f"Dataset at {self.dataset_path} must contain 'text' and 'label' columns."
             )
 
+        if "answer" not in data.columns:
+            data["answer"] = ""
+
         data = data.dropna(subset=["text", "label"]).copy()
-        data["text"] = data["text"].apply(self.preprocess)
+        data["text"] = data["text"].astype(str)
+        data["label"] = data["label"].astype(str)
+        data["answer"] = data["answer"].fillna("").astype(str)
+
+        self.raw_dataset = data.copy()
+
+        # Build exact-match answer map
+        self.direct_answer_map = {
+            self.preprocess(row["text"]): row["answer"].strip()
+            for _, row in data.iterrows()
+            if row["answer"].strip()
+        }
+
+        # Train classifier using normalized text
+        data["clean_text"] = data["text"].apply(self.preprocess)
         self.label_distribution = data["label"].value_counts().to_dict()
 
         if len(data) < 3:
-            X = self.vectorizer.fit_transform(data["text"])
+            X = self.vectorizer.fit_transform(data["clean_text"])
             self.model.fit(X, data["label"])
             self.train_accuracy = 1.0
             self.test_accuracy = None
@@ -94,7 +118,7 @@ class EmbeddedTextClassifier:
         stratify_labels = data["label"] if data["label"].nunique() > 1 else None
 
         X_train, X_test, y_train, y_test = train_test_split(
-            data["text"],
+            data["clean_text"],
             data["label"],
             test_size=0.2,
             random_state=42,
@@ -108,6 +132,11 @@ class EmbeddedTextClassifier:
         self.train_accuracy = self.model.score(X_train_tfidf, y_train)
         self.test_accuracy = self.model.score(X_test_tfidf, y_test)
         self.is_trained = True
+
+    def get_direct_answer(self, text: str) -> Optional[str]:
+        normalized = self.preprocess(text)
+        answer = self.direct_answer_map.get(normalized, "").strip()
+        return answer if answer else None
 
     def predict(self, text: str) -> str:
         if not self.is_trained:
@@ -145,15 +174,10 @@ class AdvancedLocalRAG:
     """
     Hybrid local RAG over:
     - classifier examples
+    - stored direct-answer examples
     - label summaries
     - profile/rule snippets
-    - optional raw answer snippets
-
-    Retrieval combines:
-    - TF-IDF similarity
-    - lexical overlap
-    - label prior boost
-    - MMR reranking
+    - raw answer snippets
     """
 
     def __init__(self, documents: List[Dict[str, Any]]) -> None:
@@ -328,6 +352,12 @@ class EnglishRemodeler:
         self.dataset_path = self.classifier.dataset_path
         self.rag = AdvancedLocalRAG(self._build_rag_documents())
 
+    def has_direct_answer(self, user_query: str) -> bool:
+        return self.classifier.get_direct_answer(user_query) is not None
+
+    def get_direct_answer(self, user_query: str) -> Optional[str]:
+        return self.classifier.get_direct_answer(user_query)
+
     def _build_rag_documents(self) -> List[Dict[str, Any]]:
         docs: List[Dict[str, Any]] = []
 
@@ -337,15 +367,20 @@ class EnglishRemodeler:
                 f"Dataset at {self.dataset_path} must contain 'text' and 'label' columns."
             )
 
+        if "answer" not in data.columns:
+            data["answer"] = ""
+
         data = data.dropna(subset=["text", "label"]).copy()
         data["text"] = data["text"].astype(str)
         data["label"] = data["label"].astype(str)
+        data["answer"] = data["answer"].fillna("").astype(str)
 
         label_examples: Dict[str, List[str]] = defaultdict(list)
 
         for idx, row in data.iterrows():
             text = str(row["text"]).strip()
             label = str(row["label"]).strip()
+            answer = str(row["answer"]).strip()
 
             docs.append(
                 {
@@ -358,6 +393,21 @@ class EnglishRemodeler:
                 }
             )
             label_examples[label].append(text)
+
+            if answer:
+                docs.append(
+                    {
+                        "doc_id": f"dataset_answer::{idx}",
+                        "text": (
+                            f"Known direct-answer pair. User query: {text}. "
+                            f"Stored answer: {answer}. Label: {label}."
+                        ),
+                        "metadata": {
+                            "kind": "dataset_direct_answer",
+                            "label": label,
+                        },
+                    }
+                )
 
         for label, examples in label_examples.items():
             preview = " | ".join(examples[:8])
@@ -517,6 +567,11 @@ class EnglishRemodeler:
         return "\n".join(lines)
 
     def remodel(self, user_query: str, raw_answer: str, profile: Dict[str, Any]) -> str:
+        # Exact match shortcut from classifier dataset
+        direct_answer = self.get_direct_answer(user_query)
+        if direct_answer:
+            return direct_answer
+
         profile_summary = profile.get("profile_summary", "")
         rules = profile.get("behaviour_rules", {})
 

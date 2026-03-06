@@ -1,20 +1,20 @@
-text,label
-Hi,Low
-Hello,Low
-Good morning,Low
-Vanakkam,Low
-How are you?,Low
-Hey there,Low
-Good evening,Low
-What is Python?,Medium
-Explain machine learning,Medium
-How to install VS Code?,Medium
-Photosynthesis என்றால் என்ன?,Medium
-Database எப்படி create பண்ணுவது?,Medium
-What is API?,Medium
-Explain OpenAI API architecture,High
-How does GPT work?,High
-Build chatbot using OpenAI,High
-Fine tuning GPT steps explain,High
-OpenAI pricing model details,High
-Explain transformer architecture in detail,High
+text,label,answer
+Hi,Low,Hi! How can I help you today?
+Hello,Low,Hello! How can I help you today?
+Good morning,Low,Good morning! How can I assist you today?
+Vanakkam,Low,Vanakkam! Ungalukku enna help venum?
+How are you?,Low,I’m doing well and ready to help you. How are you?
+Hey there,Low,Hey there! What can I do for you?
+Good evening,Low,Good evening! How can I help you today?
+What is Python?,Medium,Python is a high-level programming language known for its simple syntax and wide use in web development, automation, data science, and AI.
+Explain machine learning,Medium,Machine learning is a branch of AI where systems learn patterns from data and make predictions or decisions without being explicitly programmed for every case.
+How to install VS Code?,Medium,Download Visual Studio Code from the official website, run the installer, follow the setup steps, and then open the app after installation.
+Photosynthesis என்றால் என்ன?,Medium,Photosynthesis என்பது தாவரங்கள் சூரியஒளி, நீர், மற்றும் கார்பன் டையாக்சைடை பயன்படுத்தி உணவு தயாரிக்கும் செயல்முறை.
+Database எப்படி create பண்ணுவது?,Medium,முதலில் எந்த database system பயன்படுத்தப் போகிறீர்கள் என்பதை தேர்வு செய்யுங்கள். பிறகு database server-ல் login செய்து CREATE DATABASE command மூலம் புதிய database உருவாக்கலாம்.
+What is API?,Medium,API stands for Application Programming Interface. It allows different software systems to communicate with each other using defined rules.
+Explain OpenAI API architecture,High,OpenAI API architecture typically involves client applications sending requests to hosted AI models through secure endpoints, with authentication, request handling, model inference, and structured responses.
+How does GPT work?,High,GPT works by predicting the next token in a sequence using a transformer architecture trained on large amounts of text data, allowing it to generate context-aware responses.
+Build chatbot using OpenAI,High,To build a chatbot using OpenAI, create a backend service, connect it to the OpenAI API, send user messages as prompts, manage conversation history, and return model responses to the frontend.
+Fine tuning GPT steps explain,High,Fine-tuning GPT usually involves preparing a training dataset, formatting examples properly, uploading the data, starting a fine-tuning job, evaluating the model, and then using the fine-tuned model in production.
+OpenAI pricing model details,High,OpenAI pricing usually depends on the model used and the number of input and output tokens processed. Some tools or premium features may have separate pricing.
+Explain transformer architecture in detail,High,Transformer architecture is built around self-attention, positional encoding, feed-forward layers, residual connections, and normalization, enabling efficient parallel processing of sequence data.

@@ -21,8 +21,15 @@ class PersonaTamilPipeline:
 
     def run(self, user_query: str) -> Dict[str, str]:
         profile_context = self.behaviour.build_runtime_context(self.profile, user_query=user_query)
-        raw_english = self.core.answer_user_query(user_query, profile_context)
-        remodeled_english = self.remodeler.remodel(user_query, raw_english, self.profile)
+
+        direct_answer = self.remodeler.get_direct_answer(user_query)
+        if direct_answer:
+            raw_english = direct_answer
+            remodeled_english = direct_answer
+        else:
+            raw_english = self.core.answer_user_query(user_query, profile_context)
+            remodeled_english = self.remodeler.remodel(user_query, raw_english, self.profile)
+
         tamil_text = self.translator.english_to_tamil(remodeled_english, self.profile)
         theni_tamil_text = self.translator.tamil_to_thenitamil(tamil_text)
 
