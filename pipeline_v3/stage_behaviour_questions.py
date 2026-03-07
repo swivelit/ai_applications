@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from config import (
     DATA_DIR,
     LOGS_DIR,
+    MAX_HISTORY_DOCS,
+    MAX_PROFILE_MEMORY_ROWS,
     MEDICAL_SAFETY_NOTE,
     PREGNANCY_CUSTOM_AVOID_LIST,
     PROFILE_VERSION,
@@ -135,41 +137,32 @@ QUESTIONS: List[Dict[str, Any]] = [
 
 
 class LocalHybridRAG:
-    """
-    Lightweight hybrid retriever:
-    - normalization
-    - lexical overlap
-    - tf-idf sparse vectors
-    - synonym expansion
-    - MMR diversity selection
-    """
+    """Small dependency-free hybrid retriever for profile grounding and memory."""
 
     def __init__(self, documents: List[Dict[str, Any]]) -> None:
         self.documents = documents or []
-        self.doc_tokens: List[List[str]] = []
-        self.doc_vectors: List[Dict[str, float]] = []
-        self.idf: Dict[str, float] = {}
         self.stopwords = {
             "a", "an", "the", "and", "or", "but", "if", "to", "for", "of", "in", "on",
             "at", "by", "with", "from", "as", "is", "are", "was", "were", "be", "been",
-            "this", "that", "these", "those", "it", "its", "into", "about", "your",
-            "you", "user", "question", "answer", "profile", "assistant", "most", "best",
-            "usually", "right", "now", "how", "what", "which", "when", "do", "does",
-            "can", "should", "would", "could", "up", "one", "two", "three"
+            "this", "that", "these", "those", "it", "its", "into", "about", "your", "you",
+            "user", "question", "answer", "profile", "assistant", "most", "best", "how", "what",
+            "which", "when", "do", "does", "can", "should", "would", "could", "right", "now",
         }
         self.synonyms = {
-            "pregnancy": ["pregnant", "conceive", "breastfeeding", "postpartum"],
-            "sugar": ["diabetes", "sweet", "dessert", "glucose"],
+            "pregnancy": ["pregnant", "conceive", "postpartum", "breastfeeding"],
+            "sugar": ["diabetes", "sweet", "glucose", "dessert"],
             "blood": ["pressure", "heart", "salt"],
+            "stress": ["anxiety", "reassurance", "support"],
+            "health": ["wellness", "medical", "safe", "safety", "condition"],
+            "food": ["diet", "meal", "eat", "caution", "preference"],
             "tone": ["style", "communication", "talk"],
-            "stress": ["support", "anxiety", "reassurance"],
-            "health": ["wellness", "medical", "condition", "safe", "safety"],
-            "food": ["diet", "meal", "eat", "eating", "preference", "caution"],
-            "personality": ["trait", "temperament", "behavior", "behaviour"],
-            "work": ["career", "professional", "business", "job"],
+            "work": ["career", "business", "professional", "job"],
             "family": ["parent", "caregiver", "home", "homemaker"],
             "greeting": ["hi", "hello", "vanakkam", "hey"],
         }
+        self.doc_tokens: List[List[str]] = []
+        self.doc_vectors: List[Dict[str, float]] = []
+        self.idf: Dict[str, float] = {}
         self._fit()
 
     @staticmethod
@@ -192,9 +185,9 @@ class LocalHybridRAG:
             if token in self.synonyms:
                 expanded.extend(self.synonyms[token])
 
-        for key, values in self.synonyms.items():
+        for root, values in self.synonyms.items():
             if token_set.intersection(values):
-                expanded.append(key)
+                expanded.append(root)
                 expanded.extend(values)
 
         return expanded
@@ -203,7 +196,7 @@ class LocalHybridRAG:
         if not self.documents:
             return
 
-        df_counter: Counter = Counter()
+        df_counts: Counter = Counter()
         tokenized_docs: List[List[str]] = []
 
         for doc in self.documents:
@@ -211,26 +204,19 @@ class LocalHybridRAG:
             tokenized_docs.append(tokens)
             self.doc_tokens.append(tokens)
             for token in set(tokens):
-                df_counter[token] += 1
+                df_counts[token] += 1
 
         total_docs = max(len(tokenized_docs), 1)
-        self.idf = {
-            token: math.log((1 + total_docs) / (1 + df_counter[token])) + 1.0
-            for token in df_counter
-        }
+        self.idf = {token: math.log((1 + total_docs) / (1 + count)) + 1.0 for token, count in df_counts.items()}
         self.doc_vectors = [self._tfidf_vector(tokens) for tokens in tokenized_docs]
 
     def _tfidf_vector(self, tokens: List[str]) -> Dict[str, float]:
         if not tokens:
             return {}
-
         counts = Counter(tokens)
         total = sum(counts.values()) or 1
-        vector: Dict[str, float] = {}
-        for token, count in counts.items():
-            vector[token] = (count / total) * self.idf.get(token, 1.0)
-
-        norm = math.sqrt(sum(v * v for v in vector.values())) or 1.0
+        vector = {token: (count / total) * self.idf.get(token, 1.0) for token, count in counts.items()}
+        norm = math.sqrt(sum(value * value for value in vector.values())) or 1.0
         return {token: value / norm for token, value in vector.items()}
 
     @staticmethod
@@ -266,40 +252,37 @@ class LocalHybridRAG:
         for idx, doc in enumerate(self.documents):
             semantic = self._cosine_sparse(query_vec, self.doc_vectors[idx])
             lexical = self._jaccard(query_tokens, self.doc_tokens[idx])
-
             meta = doc.get("metadata", {})
             kind = str(meta.get("kind", ""))
-            kind_boost = 0.03 if kind in {"history", "rule", "profile"} else 0.0
-
-            score = (0.70 * semantic) + (0.24 * lexical) + kind_boost
+            freshness_boost = 0.0
+            if kind in {"history", "rule", "profile", "personality_example"}:
+                freshness_boost += 0.03
+            if kind == "profile_summary":
+                freshness_boost += 0.05
+            score = (0.68 * semantic) + (0.24 * lexical) + freshness_boost
             if score >= min_score:
                 scored.append((idx, score))
 
         if not scored:
             return []
 
-        scored.sort(key=lambda x: x[1], reverse=True)
-        candidate_indices = [idx for idx, _ in scored[: max(top_k * 3, top_k)]]
+        scored.sort(key=lambda item: item[1], reverse=True)
+        candidates = [idx for idx, _ in scored[: max(top_k * 3, top_k)]]
+        selected_indices: List[int] = []
+        results: List[Dict[str, Any]] = []
 
-        selected: List[int] = []
-        selected_results: List[Dict[str, Any]] = []
-
-        while candidate_indices and len(selected) < top_k:
+        while candidates and len(selected_indices) < top_k:
             best_idx = None
             best_mmr = -1e9
-
-            for idx in list(candidate_indices):
+            for idx in list(candidates):
                 relevance = next(score for cand_idx, score in scored if cand_idx == idx)
-
                 diversity_penalty = 0.0
-                if selected:
+                if selected_indices:
                     diversity_penalty = max(
-                        self._cosine_sparse(self.doc_vectors[idx], self.doc_vectors[s_idx])
-                        for s_idx in selected
+                        self._cosine_sparse(self.doc_vectors[idx], self.doc_vectors[chosen])
+                        for chosen in selected_indices
                     )
-
                 mmr_score = (mmr_lambda * relevance) - ((1 - mmr_lambda) * diversity_penalty)
-
                 if mmr_score > best_mmr:
                     best_mmr = mmr_score
                     best_idx = idx
@@ -307,36 +290,33 @@ class LocalHybridRAG:
             if best_idx is None:
                 break
 
-            selected.append(best_idx)
-            candidate_indices.remove(best_idx)
-
+            candidates.remove(best_idx)
+            selected_indices.append(best_idx)
             original_score = next(score for cand_idx, score in scored if cand_idx == best_idx)
             result = dict(self.documents[best_idx])
             result["retrieval_score"] = round(float(original_score), 4)
-            selected_results.append(result)
+            results.append(result)
 
-        return selected_results
+        return results
 
 
 class BehaviourQuestionnaire:
     def __init__(self, profiles_dir: Path = PROFILES_DIR) -> None:
         self.profiles_dir = profiles_dir
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
-
         self.personality_dataset_path = DATA_DIR / "personality_15_question_dataset.json"
         self.rag = LocalHybridRAG(self._build_knowledge_documents())
 
+    @staticmethod
+    def _sanitize_user_id(user_id: str) -> str:
+        safe = "".join(ch for ch in str(user_id).strip() if ch.isalnum() or ch in ("_", "-"))
+        return safe or "default_user"
+
     def _profile_path(self, user_id: str) -> Path:
-        safe_user_id = "".join(ch for ch in str(user_id) if ch.isalnum() or ch in ("_", "-"))
-        if not safe_user_id:
-            safe_user_id = "default_user"
-        return self.profiles_dir / f"{safe_user_id}.json"
+        return self.profiles_dir / f"{self._sanitize_user_id(user_id)}.json"
 
     def _history_log_path(self, user_id: str) -> Path:
-        safe_user_id = "".join(ch for ch in str(user_id) if ch.isalnum() or ch in ("_", "-"))
-        if not safe_user_id:
-            safe_user_id = "default_user"
-        return LOGS_DIR / f"{safe_user_id}_history.jsonl"
+        return LOGS_DIR / f"{self._sanitize_user_id(user_id)}_history.jsonl"
 
     def profile_exists(self, user_id: str) -> bool:
         return self._profile_path(user_id).exists()
@@ -345,28 +325,48 @@ class BehaviourQuestionnaire:
         path = self._profile_path(user_id)
         if not path.exists():
             raise FileNotFoundError(f"Profile not found for user_id={user_id}")
-        return json.loads(path.read_text(encoding="utf-8"))
+        profile = json.loads(path.read_text(encoding="utf-8"))
+        return self._upgrade_profile(profile)
 
     def save_profile(self, user_id: str, profile: Dict[str, Any]) -> None:
+        upgraded = self._upgrade_profile(profile)
         path = self._profile_path(user_id)
-        path.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")
+        path.write_text(json.dumps(upgraded, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def ensure_profile(self, user_id: str) -> Dict[str, Any]:
         if self.profile_exists(user_id):
             return self.load_profile(user_id)
         return self.run_first_time_questionnaire(user_id)
 
+    def _upgrade_profile(self, profile: Dict[str, Any]) -> Dict[str, Any]:
+        answers = profile.get("answers", {}) or {}
+        behaviour_rules = profile.get("behaviour_rules", {}) or {}
+        personality_rag = profile.get("rag_personality_hints", {}) or {}
+
+        if not behaviour_rules:
+            behaviour_rules = self._derive_behaviour_rules(answers)
+        if not personality_rag:
+            personality_rag = self._infer_personality_rag_from_answers(answers)
+
+        profile.setdefault("user_id", "default_user")
+        profile.setdefault("created_at", datetime.utcnow().isoformat() + "Z")
+        profile["profile_version"] = PROFILE_VERSION
+        profile["answers"] = answers
+        profile["behaviour_rules"] = behaviour_rules
+        profile["rag_personality_hints"] = personality_rag
+        profile["profile_summary"] = self._build_profile_summary(answers, behaviour_rules, personality_rag)
+        profile["profile_card"] = self._build_profile_card(answers, behaviour_rules, personality_rag)
+        return profile
+
     def run_first_time_questionnaire(self, user_id: str) -> Dict[str, Any]:
         print("\nFirst-time profile setup started.")
         print(f"Please answer these {QUESTION_COUNT} questions so responses can be personalized safely.\n")
 
         answers: Dict[str, Any] = {}
-
         for index, question in enumerate(QUESTIONS, start=1):
             print(f"Q{index}. {question['prompt']}")
             for option_index, option in enumerate(question["options"], start=1):
                 print(f"  {option_index}. {option}")
-
             if question["type"] == "single":
                 answers[question["id"]] = self._ask_single_choice(question)
             else:
@@ -375,19 +375,17 @@ class BehaviourQuestionnaire:
 
         behaviour_rules = self._derive_behaviour_rules(answers)
         personality_rag = self._infer_personality_rag_from_answers(answers)
-        profile_summary = self._build_profile_summary(answers, behaviour_rules, personality_rag)
 
         profile = {
             "profile_version": PROFILE_VERSION,
-            "user_id": user_id,
+            "user_id": self._sanitize_user_id(user_id),
             "created_at": datetime.utcnow().isoformat() + "Z",
             "answers": answers,
             "behaviour_rules": behaviour_rules,
-            "profile_summary": profile_summary,
             "rag_personality_hints": personality_rag,
         }
+        profile = self._upgrade_profile(profile)
         self.save_profile(user_id, profile)
-
         print("Profile created successfully.\n")
         return profile
 
@@ -401,7 +399,7 @@ class BehaviourQuestionnaire:
 
     def _ask_multi_choice(self, question: Dict[str, Any]) -> List[str]:
         max_index = len(question["options"])
-        max_choices = question.get("max_choices", 3)
+        max_choices = int(question.get("max_choices", 3))
 
         while True:
             raw = input(f"Select up to {max_choices} option numbers separated by comma: ").strip()
@@ -430,9 +428,11 @@ class BehaviourQuestionnaire:
             return selected
 
     def _derive_behaviour_rules(self, answers: Dict[str, Any]) -> Dict[str, Any]:
-        health_conditions = answers.get("health_conditions", [])
-        life_stage = answers.get("life_stage", "")
-        food_caution = answers.get("food_caution", "")
+        health_conditions = answers.get("health_conditions", []) or []
+        life_stage = str(answers.get("life_stage", ""))
+        food_caution = str(answers.get("food_caution", ""))
+        sleep_pattern = str(answers.get("sleep_pattern", ""))
+        daily_activity = str(answers.get("daily_activity", ""))
 
         is_pregnant = life_stage == "pregnant"
         postpartum_related = life_stage == "postpartum_or_breastfeeding"
@@ -445,18 +445,17 @@ class BehaviourQuestionnaire:
         avoid_items: List[str] = []
         avoid_topics: List[str] = []
         mandatory_notes: List[str] = [MEDICAL_SAFETY_NOTE]
+        response_style_bias: List[str] = []
 
         if is_pregnant:
             avoid_items.extend(PREGNANCY_CUSTOM_AVOID_LIST)
             mandatory_notes.append(
                 "If the user is pregnant, avoid risky food, medicine, herbal, or crash-diet suggestions. Do not recommend pineapple."
             )
-
         if postpartum_related:
             mandatory_notes.append(
                 "If the user is postpartum or breastfeeding, keep dietary and medicine advice extra cautious and avoid strong unsupported claims."
             )
-
         if trying_to_conceive:
             mandatory_notes.append(
                 "If the user is trying to conceive, avoid risky fertility claims or food certainty."
@@ -464,22 +463,24 @@ class BehaviourQuestionnaire:
 
         if has_diabetes or food_caution == "avoid_sugary_foods":
             avoid_items.extend(["high sugar drinks", "excess sweets", "dessert-heavy suggestions"])
+            avoid_topics.append("sugar spikes")
             mandatory_notes.append("For sugar-control users, avoid advice that increases sugar load.")
-
         if has_bp:
             avoid_items.extend(["high salt foods", "energy drinks", "stimulant-heavy suggestions"])
+            avoid_topics.append("high stimulant recommendations")
             mandatory_notes.append("For blood pressure or heart-care users, avoid high-salt and stimulant-heavy advice.")
-
         if has_thyroid:
-            mandatory_notes.append(
-                "For thyroid or hormonal-care users, avoid confident medical certainty and diagnosis-like phrasing."
-            )
-
+            avoid_topics.append("diagnosis-like certainty")
+            mandatory_notes.append("For thyroid or hormonal-care users, avoid confident medical certainty and diagnosis-like phrasing.")
         if has_other_sensitive or food_caution == "allergy_or_doctor_given_restrictions":
-            avoid_topics.append("confident medical certainty")
+            avoid_topics.append("confident ingredient safety claims")
             mandatory_notes.append(
                 "For allergy, digestion, kidney, or doctor-restricted users, avoid ingredient-specific certainty unless the user confirms safety."
             )
+        if food_caution == "avoid_spicy_or_oily_foods":
+            avoid_items.extend(["very spicy foods", "deep fried foods", "heavy oily meals"])
+        if food_caution == "avoid_packaged_or_junk_foods":
+            avoid_items.extend(["ultra-processed snacks", "junk food", "packaged sweet drinks"])
 
         tone_map = {
             "warm": "warm, caring, and clear",
@@ -488,7 +489,6 @@ class BehaviourQuestionnaire:
             "detailed": "detailed and structured",
             "friendly_casual": "friendly and conversational",
         }
-
         answer_length_map = {
             "very_short": "2-3 lines",
             "short": "1 short paragraph",
@@ -497,65 +497,64 @@ class BehaviourQuestionnaire:
             "depends_on_question": "adapt length to question complexity",
         }
 
-        response_style_bias: List[str] = []
+        personality_style = str(answers.get("personality_style", ""))
+        stress_support = str(answers.get("stress_support", ""))
+        main_goal = str(answers.get("main_goal", ""))
+        family_role = str(answers.get("family_role", ""))
 
-        personality_style = answers.get("personality_style", "")
-        stress_support = answers.get("stress_support", "")
-        main_goal = answers.get("main_goal", "")
-        family_role = answers.get("family_role", "")
+        personality_bias_map = {
+            "calm": "Keep wording calm and steady.",
+            "friendly": "Use encouraging and socially warm language.",
+            "practical": "Prefer concrete, actionable steps over abstract advice.",
+            "ambitious": "Frame suggestions in goal-oriented language.",
+            "emotional_sensitive": "Use gentle, emotionally careful wording.",
+        }
+        stress_bias_map = {
+            "gentle_reassurance": "Start with reassurance before giving advice.",
+            "direct_solution": "Give the answer quickly, then the supporting detail.",
+            "step_by_step_plan": "Prefer numbered or stepwise explanations.",
+            "motivation": "Use a supportive tone without exaggeration.",
+            "space_and_time": "Avoid sounding pushy unless safety requires it.",
+        }
+        goal_bias_map = {
+            "health": "Prioritize health-conscious framing.",
+            "family": "Acknowledge family practicality when relevant.",
+            "career_or_business": "Prefer efficient and outcome-focused framing.",
+            "peace_of_mind": "Reduce unnecessary alarm in phrasing.",
+            "learning_and_growth": "Include short explanatory context when helpful.",
+        }
+        role_bias_map = {
+            "student": "Use simple and approachable language.",
+            "working_professional": "Keep answers time-efficient and practical.",
+            "homemaker": "Allow home and routine-oriented framing when relevant.",
+            "caregiver_parent": "Be mindful of time, stress, and caregiving load.",
+            "self_employed": "Keep recommendations flexible and outcome-focused.",
+        }
 
-        if personality_style == "calm":
-            response_style_bias.append("Keep wording calm and steady.")
-        elif personality_style == "friendly":
-            response_style_bias.append("Use encouraging and socially warm language.")
-        elif personality_style == "practical":
-            response_style_bias.append("Prefer concrete, actionable steps over abstract advice.")
-        elif personality_style == "ambitious":
-            response_style_bias.append("Frame suggestions in goal-oriented language.")
-        elif personality_style == "emotional_sensitive":
-            response_style_bias.append("Use gentle, emotionally careful wording.")
+        for mapping, key in [
+            (personality_bias_map, personality_style),
+            (stress_bias_map, stress_support),
+            (goal_bias_map, main_goal),
+            (role_bias_map, family_role),
+        ]:
+            if key in mapping:
+                response_style_bias.append(mapping[key])
 
-        if stress_support == "gentle_reassurance":
-            response_style_bias.append("Start with reassurance before giving advice.")
-        elif stress_support == "direct_solution":
-            response_style_bias.append("Give the answer quickly, then the supporting detail.")
-        elif stress_support == "step_by_step_plan":
-            response_style_bias.append("Prefer numbered or stepwise explanations.")
-        elif stress_support == "motivation":
-            response_style_bias.append("Use a supportive tone without exaggeration.")
-        elif stress_support == "space_and_time":
-            response_style_bias.append("Avoid sounding pushy unless safety requires it.")
-
-        if main_goal == "health":
-            response_style_bias.append("Prioritize health-conscious framing.")
-        elif main_goal == "family":
-            response_style_bias.append("Acknowledge family practicality when relevant.")
-        elif main_goal == "career_or_business":
-            response_style_bias.append("Prefer efficient and outcome-focused framing.")
-        elif main_goal == "peace_of_mind":
-            response_style_bias.append("Reduce unnecessary alarm in phrasing.")
-        elif main_goal == "learning_and_growth":
-            response_style_bias.append("Include short explanatory context when helpful.")
-
-        if family_role == "student":
-            response_style_bias.append("Use simple and approachable language.")
-        elif family_role == "working_professional":
-            response_style_bias.append("Keep answers time-efficient and practical.")
-        elif family_role == "homemaker":
-            response_style_bias.append("Allow home and routine-oriented framing when relevant.")
-        elif family_role == "caregiver_parent":
-            response_style_bias.append("Be mindful of time, stress, and caregiving load.")
-        elif family_role == "self_employed":
-            response_style_bias.append("Keep recommendations flexible and outcome-focused.")
+        if sleep_pattern in {"poor", "inconsistent"}:
+            response_style_bias.append("Keep suggestions realistic for someone with low or inconsistent energy.")
+        if daily_activity in {"active_work", "fitness_focused"}:
+            response_style_bias.append("Use energetic but practical wording when discussing routines or food.")
+        elif daily_activity == "mostly_sitting":
+            response_style_bias.append("Prefer sustainable, low-friction suggestions.")
 
         return {
             "preferred_tone": tone_map.get(answers.get("communication_tone", "warm"), "warm and clear"),
-            "preferred_answer_length": answer_length_map.get(answers.get("answer_length", "medium"), "1-2 paragraphs"),
-            "primary_goal": answers.get("main_goal"),
+            "preferred_answer_length": answer_length_map.get(answers.get("answer_length", "medium"), "1-2 balanced paragraphs"),
+            "primary_goal": answers.get("main_goal", ""),
             "avoid_items": sorted(set(avoid_items)),
             "avoid_topics": sorted(set(avoid_topics)),
-            "mandatory_notes": mandatory_notes,
-            "response_style_bias": response_style_bias,
+            "mandatory_notes": list(dict.fromkeys(mandatory_notes)),
+            "response_style_bias": list(dict.fromkeys(response_style_bias)),
             "health_flags": {
                 "pregnant": is_pregnant,
                 "postpartum_or_breastfeeding": postpartum_related,
@@ -567,6 +566,24 @@ class BehaviourQuestionnaire:
             },
         }
 
+    def _build_profile_card(
+        self,
+        answers: Dict[str, Any],
+        behaviour_rules: Dict[str, Any],
+        personality_rag: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "tone": behaviour_rules.get("preferred_tone", "warm and clear"),
+            "answer_length": behaviour_rules.get("preferred_answer_length", "1-2 balanced paragraphs"),
+            "life_stage": answers.get("life_stage", ""),
+            "food_preference": answers.get("food_preference", ""),
+            "health_conditions": answers.get("health_conditions", []) or [],
+            "main_goal": answers.get("main_goal", ""),
+            "style_bias": behaviour_rules.get("response_style_bias", []) or [],
+            "avoid_items": behaviour_rules.get("avoid_items", []) or [],
+            "personality_traits": (personality_rag or {}).get("top_traits", []),
+        }
+
     def _build_profile_summary(
         self,
         answers: Dict[str, Any],
@@ -576,41 +593,35 @@ class BehaviourQuestionnaire:
         hobbies = ", ".join(answers.get("hobbies", [])) or "no hobby preference recorded"
         health_conditions = ", ".join(answers.get("health_conditions", [])) or "none"
         avoid_items = ", ".join(behaviour_rules.get("avoid_items", [])) or "none"
-
-        personality_line = ""
-        if personality_rag:
-            top_traits = ", ".join(personality_rag.get("top_traits", [])) or "balanced"
-            personality_hint = personality_rag.get("personality_summary", "")
-            personality_line = (
-                f" Retrieved personality hints suggest traits such as {top_traits}. "
-                f"{personality_hint}"
-            )
+        traits = ", ".join((personality_rag or {}).get("top_traits", [])) or "balanced"
+        personality_sentence = (personality_rag or {}).get("personality_summary", "")
 
         return (
-            f"The user belongs to the {answers.get('age_group')} age group and identifies their context as "
-            f"{answers.get('gender_context')}. Their current life-stage is {answers.get('life_stage')}. "
-            f"They prefer a {answers.get('food_preference')} food style, with health-related context recorded as: {health_conditions}. "
-            f"Important food caution: {answers.get('food_caution')}. Their daily activity is {answers.get('daily_activity')} and sleep is usually {answers.get('sleep_pattern')}. "
-            f"Their personality comes across as {answers.get('personality_style')}, and during stress they prefer {answers.get('stress_support')}. "
-            f"The assistant should use a {behaviour_rules.get('preferred_tone')} tone and usually keep answers to {behaviour_rules.get('preferred_answer_length')}. "
-            f"They enjoy {hobbies}, and their current priority is {answers.get('main_goal')}. "
-            f"Their daily role is closest to {answers.get('family_role')}. Avoid recommending: {avoid_items}."
-            f"{personality_line}"
+            f"User age group: {answers.get('age_group', '')}. "
+            f"Gender context: {answers.get('gender_context', '')}. "
+            f"Life stage: {answers.get('life_stage', '')}. "
+            f"Food style: {answers.get('food_preference', '')}. "
+            f"Health context: {health_conditions}. "
+            f"Food caution: {answers.get('food_caution', '')}. "
+            f"Daily activity: {answers.get('daily_activity', '')}. Sleep pattern: {answers.get('sleep_pattern', '')}. "
+            f"Personality style: {answers.get('personality_style', '')}. Stress support preference: {answers.get('stress_support', '')}. "
+            f"Preferred assistant tone: {behaviour_rules.get('preferred_tone', '')}. Preferred answer length: {behaviour_rules.get('preferred_answer_length', '')}. "
+            f"Hobbies: {hobbies}. Main goal: {answers.get('main_goal', '')}. Family role: {answers.get('family_role', '')}. "
+            f"Avoid recommending: {avoid_items}. Top personality traits: {traits}. {personality_sentence}".strip()
         )
 
     def _build_knowledge_documents(self) -> List[Dict[str, Any]]:
         docs: List[Dict[str, Any]] = []
 
-        for q in QUESTIONS:
-            option_text = ", ".join(q.get("options", []))
+        for question in QUESTIONS:
             docs.append(
                 {
-                    "doc_id": f"question::{q['id']}",
+                    "doc_id": f"question::{question['id']}",
                     "text": (
-                        f"Question id {q['id']}. Prompt: {q['prompt']}. "
-                        f"Type: {q['type']}. Options: {option_text}."
+                        f"Question id {question['id']}. Prompt: {question['prompt']}. "
+                        f"Type: {question['type']}. Options: {', '.join(question.get('options', []))}."
                     ),
-                    "metadata": {"kind": "question", "question_id": q["id"]},
+                    "metadata": {"kind": "question", "question_id": question["id"]},
                 }
             )
 
@@ -619,33 +630,26 @@ class BehaviourQuestionnaire:
                 {
                     "doc_id": "rule::pregnancy",
                     "text": (
-                        "If the user is pregnant, trying to conceive, postpartum, or breastfeeding, "
-                        "use medically cautious guidance. Avoid risky food or medicine suggestions, alcohol, smoking, and crash dieting."
+                        "If the user is pregnant, trying to conceive, postpartum, or breastfeeding, use medically cautious guidance. "
+                        "Avoid risky food or medicine suggestions, alcohol, smoking, and crash dieting."
                     ),
                     "metadata": {"kind": "rule", "topic": "pregnancy"},
                 },
                 {
-                    "doc_id": "rule::diabetes_bp_allergy",
+                    "doc_id": "rule::conditions",
                     "text": (
-                        "For diabetes or sugar control, avoid high sugar suggestions. "
-                        "For blood pressure or heart care, avoid high salt or stimulant-heavy advice. "
+                        "For diabetes or sugar control, avoid high sugar suggestions. For blood pressure or heart care, avoid high salt or stimulant-heavy advice. "
                         "For allergy, digestion, kidney, or doctor restrictions, avoid ingredient certainty."
                     ),
                     "metadata": {"kind": "rule", "topic": "health_conditions"},
                 },
                 {
-                    "doc_id": "rule::tone",
+                    "doc_id": "rule::tone_and_length",
                     "text": (
-                        "Assistant tone should match user preference: warm, respectful, short direct, detailed, or friendly casual."
-                    ),
-                    "metadata": {"kind": "rule", "topic": "tone"},
-                },
-                {
-                    "doc_id": "rule::answer_length",
-                    "text": (
+                        "Assistant tone should match user preference: warm, respectful, short direct, detailed, or friendly casual. "
                         "Answer length can be very short, short, medium, detailed, or adaptive depending on complexity."
                     ),
-                    "metadata": {"kind": "rule", "topic": "answer_length"},
+                    "metadata": {"kind": "rule", "topic": "style"},
                 },
             ]
         )
@@ -656,35 +660,34 @@ class BehaviourQuestionnaire:
                 for item in personality_data.get("questions", []):
                     qid = item.get("id")
                     qtext = item.get("question", "")
-                    for opt_index, option in enumerate(item.get("options", []), start=1):
-                        answer = option.get("answer", "")
-                        trait = option.get("trait", "unknown")
+                    for index, option in enumerate(item.get("options", []), start=1):
                         docs.append(
                             {
-                                "doc_id": f"personality::{qid}::{opt_index}",
+                                "doc_id": f"personality::{qid}::{index}",
                                 "text": (
                                     f"Personality benchmark question: {qtext}. "
-                                    f"Possible answer: {answer}. Associated trait: {trait}."
+                                    f"Possible answer: {option.get('answer', '')}. Trait: {option.get('trait', 'unknown')}."
                                 ),
                                 "metadata": {
                                     "kind": "personality_example",
-                                    "trait": trait,
+                                    "trait": option.get("trait", "unknown"),
                                     "source_question_id": qid,
                                 },
                             }
                         )
 
                 sample_output = personality_data.get("sample_output", {})
-                docs.append(
-                    {
-                        "doc_id": "personality::summary",
-                        "text": (
-                            f"Sample personality summary: {sample_output.get('personality_summary', '')}. "
-                            f"Trait scores example: {json.dumps(sample_output.get('trait_scores', {}), ensure_ascii=False)}."
-                        ),
-                        "metadata": {"kind": "personality_summary", "source": "personality_dataset"},
-                    }
-                )
+                if sample_output:
+                    docs.append(
+                        {
+                            "doc_id": "personality::sample_output",
+                            "text": (
+                                f"Sample personality summary: {sample_output.get('personality_summary', '')}. "
+                                f"Trait scores example: {json.dumps(sample_output.get('trait_scores', {}), ensure_ascii=False)}."
+                            ),
+                            "metadata": {"kind": "personality_summary", "topic": "sample_output"},
+                        }
+                    )
             except Exception:
                 pass
 
@@ -722,7 +725,7 @@ class BehaviourQuestionnaire:
             "fitness_focused": "active",
         }
 
-        for hobby in answers.get("hobbies", []):
+        for hobby in answers.get("hobbies", []) or []:
             mapped = hobby_map.get(hobby)
             if mapped:
                 trait_scores[mapped] += 1
@@ -747,7 +750,6 @@ class BehaviourQuestionnaire:
             trait_scores["extroverted"] += 1
 
         top_traits = [trait for trait, _ in trait_scores.most_common(3)]
-
         retrieval_query = " ".join(
             [
                 str(answers.get("personality_style", "")),
@@ -755,32 +757,26 @@ class BehaviourQuestionnaire:
                 str(answers.get("stress_support", "")),
                 str(answers.get("daily_activity", "")),
                 str(answers.get("main_goal", "")),
-                " ".join(answers.get("hobbies", [])),
+                " ".join(answers.get("hobbies", []) or []),
                 " ".join(top_traits),
             ]
         ).strip()
 
         retrieved = self.rag.retrieve(retrieval_query, top_k=4, min_score=0.02)
-
-        retrieved_traits = []
-        for item in retrieved:
-            trait = item.get("metadata", {}).get("trait")
-            if trait:
-                retrieved_traits.append(trait)
-
+        retrieved_traits = [item.get("metadata", {}).get("trait") for item in retrieved if item.get("metadata", {}).get("trait")]
         merged_traits = list(dict.fromkeys(top_traits + retrieved_traits))[:4]
-        personality_summary = ""
-        if merged_traits:
-            personality_summary = (
-                "Based on the questionnaire and retrieved personality examples, "
-                f"the user appears relatively {', '.join(merged_traits)}."
-            )
+        personality_summary = (
+            "Based on the questionnaire and retrieved personality examples, the user appears relatively "
+            f"{', '.join(merged_traits)}."
+            if merged_traits
+            else ""
+        )
 
         return {
             "top_traits": merged_traits,
             "retrieved_examples": [
                 {
-                    "doc_id": item.get("doc_id"),
+                    "doc_id": item.get("doc_id", ""),
                     "text": item.get("text", ""),
                     "score": item.get("retrieval_score", 0.0),
                 }
@@ -794,15 +790,13 @@ class BehaviourQuestionnaire:
         if not log_path.exists():
             return []
 
-        documents: List[Dict[str, Any]] = []
         try:
             lines = log_path.read_text(encoding="utf-8").splitlines()
         except Exception:
             return []
 
-        recent_lines = lines[-30:]
-
-        for idx, line in enumerate(recent_lines):
+        documents: List[Dict[str, Any]] = []
+        for idx, line in enumerate(lines[-MAX_PROFILE_MEMORY_ROWS:]):
             try:
                 item = json.loads(line)
             except Exception:
@@ -810,11 +804,7 @@ class BehaviourQuestionnaire:
 
             query = str(item.get("query", "")).strip()
             result = item.get("result", {}) or {}
-            answer = (
-                str(result.get("remodeled_english", "")).strip()
-                or str(result.get("raw_english", "")).strip()
-            )
-
+            answer = str(result.get("remodeled_english", "")).strip() or str(result.get("raw_english", "")).strip()
             if not query and not answer:
                 continue
 
@@ -826,22 +816,26 @@ class BehaviourQuestionnaire:
                 }
             )
 
-        if user_query and documents:
-            temp_rag = LocalHybridRAG(documents)
-            return temp_rag.retrieve(user_query, top_k=4, min_score=0.05)
+        if not documents:
+            return []
 
-        return documents[-4:]
+        if user_query:
+            temp_rag = LocalHybridRAG(documents)
+            return temp_rag.retrieve(user_query, top_k=MAX_HISTORY_DOCS, min_score=0.05)
+
+        return documents[-MAX_HISTORY_DOCS:]
 
     def _profile_to_query(self, profile: Dict[str, Any], user_query: Optional[str] = None) -> str:
-        answers = profile.get("answers", {})
-        rules = profile.get("behaviour_rules", {})
+        answers = profile.get("answers", {}) or {}
+        rules = profile.get("behaviour_rules", {}) or {}
+        rag_hints = profile.get("rag_personality_hints", {}) or {}
 
         return " ".join(
             [
                 str(user_query or ""),
                 str(answers.get("life_stage", "")),
                 str(answers.get("food_preference", "")),
-                " ".join(answers.get("health_conditions", [])),
+                " ".join(answers.get("health_conditions", []) or []),
                 str(answers.get("food_caution", "")),
                 str(answers.get("communication_tone", "")),
                 str(answers.get("answer_length", "")),
@@ -849,70 +843,73 @@ class BehaviourQuestionnaire:
                 str(answers.get("stress_support", "")),
                 str(answers.get("main_goal", "")),
                 str(answers.get("family_role", "")),
-                " ".join(answers.get("hobbies", [])),
-                " ".join(rules.get("avoid_items", [])),
-                " ".join(rules.get("avoid_topics", [])),
+                " ".join(answers.get("hobbies", []) or []),
+                " ".join(rules.get("avoid_items", []) or []),
+                " ".join(rules.get("avoid_topics", []) or []),
+                " ".join(rag_hints.get("top_traits", []) or []),
             ]
         ).strip()
 
     def build_runtime_context(self, profile: Dict[str, Any], user_query: Optional[str] = None) -> str:
-        rules = profile.get("behaviour_rules", {})
+        profile = self._upgrade_profile(profile)
+        rules = profile.get("behaviour_rules", {}) or {}
+        answers = profile.get("answers", {}) or {}
         user_id = profile.get("user_id", "default_user")
-
-        notes = "\n- ".join(rules.get("mandatory_notes", []))
-        avoid_items = ", ".join(rules.get("avoid_items", [])) or "none"
-        avoid_topics = ", ".join(rules.get("avoid_topics", [])) or "none"
-        style_bias = "\n- ".join(rules.get("response_style_bias", [])) or "No style bias available"
 
         retrieval_query = self._profile_to_query(profile, user_query=user_query)
         retrieved = self.rag.retrieve(retrieval_query, top_k=6, min_score=0.02)
         history_docs = self._load_history_documents(user_id, user_query=user_query)
 
-        retrieved_context_lines: List[str] = []
-        for item in retrieved:
-            meta = item.get("metadata", {})
-            kind = meta.get("kind", "unknown")
-            retrieved_context_lines.append(
-                f"- [{kind}] {item.get('text', '')} (score={item.get('retrieval_score', 0.0)})"
-            )
+        personalization_context = [
+            f"- [{item.get('metadata', {}).get('kind', 'unknown')}] {item.get('text', '')} (score={item.get('retrieval_score', 0.0)})"
+            for item in retrieved
+        ]
+        memory_context = [
+            f"- {item.get('text', '')} (score={item.get('retrieval_score', 0.0)})"
+            for item in history_docs
+        ]
 
-        history_lines: List[str] = []
-        for item in history_docs:
-            history_lines.append(
-                f"- {item.get('text', '')} (score={item.get('retrieval_score', 0.0)})"
-            )
+        profile_card = profile.get("profile_card", {}) or {}
+        rag_hints = profile.get("rag_personality_hints", {}) or {}
 
-        rag_hints = profile.get("rag_personality_hints", {})
-        rag_traits = ", ".join(rag_hints.get("top_traits", [])) or "none"
-        rag_summary = rag_hints.get("personality_summary", "No additional personality summary available.")
+        mandatory_notes = rules.get("mandatory_notes", [])
+        mandatory_notes_block = "\n- ".join(mandatory_notes) if mandatory_notes else "No special notes"
 
         return f"""
 Stored user profile summary:
 {profile.get('profile_summary', '')}
 
+Compact profile card:
+- Tone: {profile_card.get('tone', 'warm and clear')}
+- Answer length: {profile_card.get('answer_length', '1-2 balanced paragraphs')}
+- Life stage: {profile_card.get('life_stage', answers.get('life_stage', ''))}
+- Food preference: {profile_card.get('food_preference', answers.get('food_preference', ''))}
+- Health conditions: {', '.join(profile_card.get('health_conditions', [])) or 'none'}
+- Main goal: {profile_card.get('main_goal', answers.get('main_goal', ''))}
+- Style bias: {', '.join(profile_card.get('style_bias', [])) or 'none'}
+- Avoid items: {', '.join(profile_card.get('avoid_items', [])) or 'none'}
+- Personality traits: {', '.join(profile_card.get('personality_traits', [])) or 'none'}
+
 Behavior rules:
 - Preferred tone: {rules.get('preferred_tone', 'warm and clear')}
-- Preferred answer length: {rules.get('preferred_answer_length', '1-2 paragraphs')}
-- Avoid items: {avoid_items}
-- Avoid topics: {avoid_topics}
+- Preferred answer length: {rules.get('preferred_answer_length', '1-2 balanced paragraphs')}
+- Avoid items: {', '.join(rules.get('avoid_items', [])) or 'none'}
+- Avoid topics: {', '.join(rules.get('avoid_topics', [])) or 'none'}
 - Mandatory notes:
-- {notes if notes else 'No special notes'}
-
-Response style bias:
-- {style_bias}
+- {mandatory_notes_block}
 
 Retrieved personality hints:
-- Top traits: {rag_traits}
-- Summary: {rag_summary}
+- Top traits: {', '.join(rag_hints.get('top_traits', [])) or 'none'}
+- Summary: {rag_hints.get('personality_summary', 'No additional personality summary available.')}
 
 Relevant personalization context:
-{chr(10).join(retrieved_context_lines) if retrieved_context_lines else '- No retrieved personalization context'}
+{chr(10).join(personalization_context) if personalization_context else '- No retrieved personalization context'}
 
 Relevant past conversation memory:
-{chr(10).join(history_lines) if history_lines else '- No matching history memory'}
+{chr(10).join(memory_context) if memory_context else '- No matching history memory'}
 
 Important behavior instruction:
 - Personalize the answer using the stored profile and relevant memory, but do not expose profile internals.
-- Keep the answer aligned with safety notes and avoid items.
+- Keep the answer aligned with safety notes, avoid items, and avoid topics.
 - If the topic is health-sensitive, avoid overclaiming and keep the answer cautious.
 """.strip()
