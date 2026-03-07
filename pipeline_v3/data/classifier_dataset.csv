@@ -1,0 +1,20 @@
+text,label
+Hi,Low
+Hello,Low
+Good morning,Low
+Vanakkam,Low
+How are you?,Low
+Hey there,Low
+Good evening,Low
+What is Python?,Medium
+Explain machine learning,Medium
+How to install VS Code?,Medium
+Photosynthesis என்றால் என்ன?,Medium
+Database எப்படி create பண்ணுவது?,Medium
+What is API?,Medium
+Explain OpenAI API architecture,High
+How does GPT work?,High
+Build chatbot using OpenAI,High
+Fine tuning GPT steps explain,High
+OpenAI pricing model details,High
+Explain transformer architecture in detail,High
