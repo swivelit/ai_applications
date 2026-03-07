@@ -22,13 +22,18 @@ class PersonaTamilPipeline:
     def run(self, user_query: str) -> Dict[str, str]:
         profile_context = self.behaviour.build_runtime_context(self.profile, user_query=user_query)
 
-        direct_answer = self.remodeler.get_direct_answer(user_query)
-        if direct_answer:
-            raw_english = direct_answer
-            remodeled_english = direct_answer
+        direct_match = self.remodeler.get_direct_answer_match(user_query)
+
+        if direct_match and direct_match.confidence >= 0.82:
+            raw_english = direct_match.answer
+            remodeled_english = direct_match.answer
+            direct_answer_source = f"{direct_match.match_type}:{direct_match.query}"
+            direct_answer_confidence = f"{direct_match.confidence:.4f}"
         else:
             raw_english = self.core.answer_user_query(user_query, profile_context)
             remodeled_english = self.remodeler.remodel(user_query, raw_english, self.profile)
+            direct_answer_source = ""
+            direct_answer_confidence = ""
 
         tamil_text = self.translator.english_to_tamil(remodeled_english, self.profile)
         theni_tamil_text = self.translator.tamil_to_thenitamil(tamil_text)
@@ -38,6 +43,8 @@ class PersonaTamilPipeline:
             "remodeled_english": remodeled_english,
             "tamil_text": tamil_text,
             "theni_tamil_text": theni_tamil_text,
+            "direct_answer_source": direct_answer_source,
+            "direct_answer_confidence": direct_answer_confidence,
         }
         self._log_pipeline_run(user_query, result)
         return result
@@ -64,6 +71,11 @@ def print_debug(result: Dict[str, str]) -> None:
     print(result["tamil_text"])
     print("\n===== THENI TAMIL =====")
     print(result["theni_tamil_text"])
+
+    if result.get("direct_answer_source"):
+        print("\n===== DIRECT ANSWER HIT =====")
+        print(result["direct_answer_source"])
+        print(f"confidence={result.get('direct_answer_confidence', '')}")
 
 
 def main() -> None:

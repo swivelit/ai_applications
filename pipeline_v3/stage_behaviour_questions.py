@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import (
-    BASE_DIR,
     DATA_DIR,
+    LOGS_DIR,
     MEDICAL_SAFETY_NOTE,
     PREGNANCY_CUSTOM_AVOID_LIST,
     PROFILE_VERSION,
@@ -134,28 +134,21 @@ QUESTIONS: List[Dict[str, Any]] = [
 ]
 
 
-# ---------------------------------------------------------------------
-# Advanced local RAG utilities
-# ---------------------------------------------------------------------
-
-
 class LocalHybridRAG:
     """
-    Lightweight local hybrid retrieval:
-    - Unicode-safe normalization
-    - query expansion
-    - TF-IDF cosine-like similarity
+    Lightweight hybrid retriever:
+    - normalization
     - lexical overlap
-    - MMR diversity reranking
+    - tf-idf sparse vectors
+    - synonym expansion
+    - MMR diversity selection
     """
 
     def __init__(self, documents: List[Dict[str, Any]]) -> None:
         self.documents = documents or []
-        self._fitted = False
-        self.vocab: Dict[str, int] = {}
-        self.idf: Dict[str, float] = {}
-        self.doc_vectors: List[Dict[str, float]] = []
         self.doc_tokens: List[List[str]] = []
+        self.doc_vectors: List[Dict[str, float]] = []
+        self.idf: Dict[str, float] = {}
         self.stopwords = {
             "a", "an", "the", "and", "or", "but", "if", "to", "for", "of", "in", "on",
             "at", "by", "with", "from", "as", "is", "are", "was", "were", "be", "been",
@@ -175,6 +168,7 @@ class LocalHybridRAG:
             "personality": ["trait", "temperament", "behavior", "behaviour"],
             "work": ["career", "professional", "business", "job"],
             "family": ["parent", "caregiver", "home", "homemaker"],
+            "greeting": ["hi", "hello", "vanakkam", "hey"],
         }
         self._fit()
 
@@ -188,9 +182,7 @@ class LocalHybridRAG:
         return text.strip()
 
     def _tokenize(self, text: Any) -> List[str]:
-        normalized = self._normalize(text)
-        tokens = [t for t in normalized.split() if t and t not in self.stopwords]
-        return tokens
+        return [t for t in self._normalize(text).split() if t and t not in self.stopwords]
 
     def _expand_tokens(self, tokens: List[str]) -> List[str]:
         expanded = list(tokens)
@@ -200,7 +192,6 @@ class LocalHybridRAG:
             if token in self.synonyms:
                 expanded.extend(self.synonyms[token])
 
-        # reverse synonym lookup
         for key, values in self.synonyms.items():
             if token_set.intersection(values):
                 expanded.append(key)
@@ -210,30 +201,24 @@ class LocalHybridRAG:
 
     def _fit(self) -> None:
         if not self.documents:
-            self._fitted = True
             return
 
-        all_doc_tokens: List[List[str]] = []
         df_counter: Counter = Counter()
+        tokenized_docs: List[List[str]] = []
 
         for doc in self.documents:
-            text = self._normalize(doc.get("text", ""))
-            tokens = self._tokenize(text)
+            tokens = self._tokenize(doc.get("text", ""))
+            tokenized_docs.append(tokens)
             self.doc_tokens.append(tokens)
-            all_doc_tokens.append(tokens)
             for token in set(tokens):
                 df_counter[token] += 1
 
-        self.vocab = {token: idx for idx, token in enumerate(sorted(df_counter.keys()))}
-        total_docs = max(len(self.documents), 1)
-
+        total_docs = max(len(tokenized_docs), 1)
         self.idf = {
             token: math.log((1 + total_docs) / (1 + df_counter[token])) + 1.0
             for token in df_counter
         }
-
-        self.doc_vectors = [self._tfidf_vector(tokens) for tokens in all_doc_tokens]
-        self._fitted = True
+        self.doc_vectors = [self._tfidf_vector(tokens) for tokens in tokenized_docs]
 
     def _tfidf_vector(self, tokens: List[str]) -> Dict[str, float]:
         if not tokens:
@@ -242,12 +227,10 @@ class LocalHybridRAG:
         counts = Counter(tokens)
         total = sum(counts.values()) or 1
         vector: Dict[str, float] = {}
-
         for token, count in counts.items():
-            tf = count / total
-            vector[token] = tf * self.idf.get(token, 1.0)
+            vector[token] = (count / total) * self.idf.get(token, 1.0)
 
-        norm = math.sqrt(sum(value * value for value in vector.values())) or 1.0
+        norm = math.sqrt(sum(v * v for v in vector.values())) or 1.0
         return {token: value / norm for token, value in vector.items()}
 
     @staticmethod
@@ -265,35 +248,30 @@ class LocalHybridRAG:
             return 0.0
         return len(s1 & s2) / max(len(s1 | s2), 1)
 
-    def _score(self, query: str, doc_idx: int) -> float:
-        query_tokens = self._expand_tokens(self._tokenize(query))
-        query_vec = self._tfidf_vector(query_tokens)
-
-        semantic = self._cosine_sparse(query_vec, self.doc_vectors[doc_idx])
-        lexical = self._jaccard(query_tokens, self.doc_tokens[doc_idx])
-
-        # small metadata boost
-        doc = self.documents[doc_idx]
-        meta_text = " ".join(str(v) for v in doc.get("metadata", {}).values())
-        meta_tokens = self._tokenize(meta_text)
-        meta_overlap = self._jaccard(query_tokens, meta_tokens)
-
-        return (0.68 * semantic) + (0.24 * lexical) + (0.08 * meta_overlap)
-
     def retrieve(
         self,
         query: str,
         *,
-        top_k: int = 5,
-        mmr_lambda: float = 0.75,
+        top_k: int = 6,
         min_score: float = 0.03,
+        mmr_lambda: float = 0.78,
     ) -> List[Dict[str, Any]]:
-        if not self._fitted or not self.documents:
+        if not self.documents:
             return []
 
+        query_tokens = self._expand_tokens(self._tokenize(query))
+        query_vec = self._tfidf_vector(query_tokens)
+
         scored: List[Tuple[int, float]] = []
-        for idx in range(len(self.documents)):
-            score = self._score(query, idx)
+        for idx, doc in enumerate(self.documents):
+            semantic = self._cosine_sparse(query_vec, self.doc_vectors[idx])
+            lexical = self._jaccard(query_tokens, self.doc_tokens[idx])
+
+            meta = doc.get("metadata", {})
+            kind = str(meta.get("kind", ""))
+            kind_boost = 0.03 if kind in {"history", "rule", "profile"} else 0.0
+
+            score = (0.70 * semantic) + (0.24 * lexical) + kind_boost
             if score >= min_score:
                 scored.append((idx, score))
 
@@ -315,11 +293,10 @@ class LocalHybridRAG:
 
                 diversity_penalty = 0.0
                 if selected:
-                    similarity_to_selected = max(
+                    diversity_penalty = max(
                         self._cosine_sparse(self.doc_vectors[idx], self.doc_vectors[s_idx])
                         for s_idx in selected
                     )
-                    diversity_penalty = similarity_to_selected
 
                 mmr_score = (mmr_lambda * relevance) - ((1 - mmr_lambda) * diversity_penalty)
 
@@ -341,11 +318,6 @@ class LocalHybridRAG:
         return selected_results
 
 
-# ---------------------------------------------------------------------
-# Behaviour questionnaire + RAG
-# ---------------------------------------------------------------------
-
-
 class BehaviourQuestionnaire:
     def __init__(self, profiles_dir: Path = PROFILES_DIR) -> None:
         self.profiles_dir = profiles_dir
@@ -355,10 +327,16 @@ class BehaviourQuestionnaire:
         self.rag = LocalHybridRAG(self._build_knowledge_documents())
 
     def _profile_path(self, user_id: str) -> Path:
-        safe_user_id = "".join(ch for ch in user_id if ch.isalnum() or ch in ("_", "-"))
+        safe_user_id = "".join(ch for ch in str(user_id) if ch.isalnum() or ch in ("_", "-"))
         if not safe_user_id:
             safe_user_id = "default_user"
         return self.profiles_dir / f"{safe_user_id}.json"
+
+    def _history_log_path(self, user_id: str) -> Path:
+        safe_user_id = "".join(ch for ch in str(user_id) if ch.isalnum() or ch in ("_", "-"))
+        if not safe_user_id:
+            safe_user_id = "default_user"
+        return LOGS_DIR / f"{safe_user_id}_history.jsonl"
 
     def profile_exists(self, user_id: str) -> bool:
         return self._profile_path(user_id).exists()
@@ -457,8 +435,11 @@ class BehaviourQuestionnaire:
         food_caution = answers.get("food_caution", "")
 
         is_pregnant = life_stage == "pregnant"
+        postpartum_related = life_stage == "postpartum_or_breastfeeding"
+        trying_to_conceive = life_stage == "trying_to_conceive"
         has_diabetes = "diabetes_or_sugar_control" in health_conditions
         has_bp = "blood_pressure_or_heart_care" in health_conditions
+        has_thyroid = "thyroid_or_hormonal_care" in health_conditions
         has_other_sensitive = "allergy_digestion_kidney_or_other" in health_conditions
 
         avoid_items: List[str] = []
@@ -468,16 +449,31 @@ class BehaviourQuestionnaire:
         if is_pregnant:
             avoid_items.extend(PREGNANCY_CUSTOM_AVOID_LIST)
             mandatory_notes.append(
-                "Business rule: when the user is pregnant, do not recommend pineapple or any risky food/medicine suggestion."
+                "If the user is pregnant, avoid risky food, medicine, herbal, or crash-diet suggestions. Do not recommend pineapple."
+            )
+
+        if postpartum_related:
+            mandatory_notes.append(
+                "If the user is postpartum or breastfeeding, keep dietary and medicine advice extra cautious and avoid strong unsupported claims."
+            )
+
+        if trying_to_conceive:
+            mandatory_notes.append(
+                "If the user is trying to conceive, avoid risky fertility claims or food certainty."
             )
 
         if has_diabetes or food_caution == "avoid_sugary_foods":
             avoid_items.extend(["high sugar drinks", "excess sweets", "dessert-heavy suggestions"])
-            mandatory_notes.append("For sugar-control users, avoid casual advice that increases sugar load.")
+            mandatory_notes.append("For sugar-control users, avoid advice that increases sugar load.")
 
         if has_bp:
             avoid_items.extend(["high salt foods", "energy drinks", "stimulant-heavy suggestions"])
             mandatory_notes.append("For blood pressure or heart-care users, avoid high-salt and stimulant-heavy advice.")
+
+        if has_thyroid:
+            mandatory_notes.append(
+                "For thyroid or hormonal-care users, avoid confident medical certainty and diagnosis-like phrasing."
+            )
 
         if has_other_sensitive or food_caution == "allergy_or_doctor_given_restrictions":
             avoid_topics.append("confident medical certainty")
@@ -501,12 +497,13 @@ class BehaviourQuestionnaire:
             "depends_on_question": "adapt length to question complexity",
         }
 
+        response_style_bias: List[str] = []
+
         personality_style = answers.get("personality_style", "")
         stress_support = answers.get("stress_support", "")
         main_goal = answers.get("main_goal", "")
         family_role = answers.get("family_role", "")
 
-        response_style_bias: List[str] = []
         if personality_style == "calm":
             response_style_bias.append("Keep wording calm and steady.")
         elif personality_style == "friendly":
@@ -521,31 +518,31 @@ class BehaviourQuestionnaire:
         if stress_support == "gentle_reassurance":
             response_style_bias.append("Start with reassurance before giving advice.")
         elif stress_support == "direct_solution":
-            response_style_bias.append("Give the answer quickly, then supporting detail.")
+            response_style_bias.append("Give the answer quickly, then the supporting detail.")
         elif stress_support == "step_by_step_plan":
             response_style_bias.append("Prefer numbered or stepwise explanations.")
         elif stress_support == "motivation":
-            response_style_bias.append("Use a supportive motivational tone without exaggeration.")
+            response_style_bias.append("Use a supportive tone without exaggeration.")
         elif stress_support == "space_and_time":
-            response_style_bias.append("Avoid sounding pushy or urgent unless safety requires it.")
+            response_style_bias.append("Avoid sounding pushy unless safety requires it.")
 
         if main_goal == "health":
             response_style_bias.append("Prioritize health-conscious framing.")
         elif main_goal == "family":
             response_style_bias.append("Acknowledge family practicality when relevant.")
         elif main_goal == "career_or_business":
-            response_style_bias.append("Prefer efficiency and clarity.")
+            response_style_bias.append("Prefer efficient and outcome-focused framing.")
         elif main_goal == "peace_of_mind":
             response_style_bias.append("Reduce unnecessary alarm in phrasing.")
         elif main_goal == "learning_and_growth":
-            response_style_bias.append("Include brief explanatory context when helpful.")
+            response_style_bias.append("Include short explanatory context when helpful.")
 
         if family_role == "student":
-            response_style_bias.append("Use simple, approachable language.")
+            response_style_bias.append("Use simple and approachable language.")
         elif family_role == "working_professional":
             response_style_bias.append("Keep answers time-efficient and practical.")
         elif family_role == "homemaker":
-            response_style_bias.append("Allow home and routine-oriented framing where relevant.")
+            response_style_bias.append("Allow home and routine-oriented framing when relevant.")
         elif family_role == "caregiver_parent":
             response_style_bias.append("Be mindful of time, stress, and caregiving load.")
         elif family_role == "self_employed":
@@ -561,8 +558,11 @@ class BehaviourQuestionnaire:
             "response_style_bias": response_style_bias,
             "health_flags": {
                 "pregnant": is_pregnant,
+                "postpartum_or_breastfeeding": postpartum_related,
+                "trying_to_conceive": trying_to_conceive,
                 "diabetes_or_sugar_control": has_diabetes,
                 "blood_pressure_or_heart_care": has_bp,
+                "thyroid_or_hormonal_care": has_thyroid,
                 "allergy_digestion_kidney_or_other": has_other_sensitive,
             },
         }
@@ -610,63 +610,46 @@ class BehaviourQuestionnaire:
                         f"Question id {q['id']}. Prompt: {q['prompt']}. "
                         f"Type: {q['type']}. Options: {option_text}."
                     ),
-                    "metadata": {
-                        "kind": "question",
-                        "question_id": q["id"],
-                        "type": q["type"],
-                    },
+                    "metadata": {"kind": "question", "question_id": q["id"]},
                 }
             )
 
-            if q["id"] == "life_stage":
-                docs.append(
-                    {
-                        "doc_id": "rule::pregnancy",
-                        "text": (
-                            "If life stage is pregnant or related to conception or breastfeeding, "
-                            "recommend cautious, medically safe, non-risky guidance. Avoid pineapple, alcohol, smoking, "
-                            "tobacco, unprescribed medicine, and crash dieting. Encourage clinician support for diagnosis and medication questions."
-                        ),
-                        "metadata": {"kind": "rule", "topic": "pregnancy"},
-                    }
-                )
+        docs.extend(
+            [
+                {
+                    "doc_id": "rule::pregnancy",
+                    "text": (
+                        "If the user is pregnant, trying to conceive, postpartum, or breastfeeding, "
+                        "use medically cautious guidance. Avoid risky food or medicine suggestions, alcohol, smoking, and crash dieting."
+                    ),
+                    "metadata": {"kind": "rule", "topic": "pregnancy"},
+                },
+                {
+                    "doc_id": "rule::diabetes_bp_allergy",
+                    "text": (
+                        "For diabetes or sugar control, avoid high sugar suggestions. "
+                        "For blood pressure or heart care, avoid high salt or stimulant-heavy advice. "
+                        "For allergy, digestion, kidney, or doctor restrictions, avoid ingredient certainty."
+                    ),
+                    "metadata": {"kind": "rule", "topic": "health_conditions"},
+                },
+                {
+                    "doc_id": "rule::tone",
+                    "text": (
+                        "Assistant tone should match user preference: warm, respectful, short direct, detailed, or friendly casual."
+                    ),
+                    "metadata": {"kind": "rule", "topic": "tone"},
+                },
+                {
+                    "doc_id": "rule::answer_length",
+                    "text": (
+                        "Answer length can be very short, short, medium, detailed, or adaptive depending on complexity."
+                    ),
+                    "metadata": {"kind": "rule", "topic": "answer_length"},
+                },
+            ]
+        )
 
-            if q["id"] == "health_conditions":
-                docs.append(
-                    {
-                        "doc_id": "rule::diabetes_bp_allergy",
-                        "text": (
-                            "For diabetes or sugar control, avoid high sugar drinks and dessert-heavy suggestions. "
-                            "For blood pressure or heart care, avoid high salt foods, energy drinks, and stimulant-heavy advice. "
-                            "For allergy, digestion, kidney, or doctor restrictions, avoid confident ingredient-specific certainty."
-                        ),
-                        "metadata": {"kind": "rule", "topic": "health_conditions"},
-                    }
-                )
-
-            if q["id"] == "communication_tone":
-                docs.append(
-                    {
-                        "doc_id": "rule::tone",
-                        "text": (
-                            "Assistant tone should match user preference: warm, respectful, short direct, detailed, or friendly casual."
-                        ),
-                        "metadata": {"kind": "rule", "topic": "tone"},
-                    }
-                )
-
-            if q["id"] == "answer_length":
-                docs.append(
-                    {
-                        "doc_id": "rule::answer_length",
-                        "text": (
-                            "Answer length can be very short, short, medium, detailed, or adaptive depending on question complexity."
-                        ),
-                        "metadata": {"kind": "rule", "topic": "answer_length"},
-                    }
-                )
-
-        # personality benchmark dataset
         if self.personality_dataset_path.exists():
             try:
                 personality_data = json.loads(self.personality_dataset_path.read_text(encoding="utf-8"))
@@ -692,18 +675,14 @@ class BehaviourQuestionnaire:
                         )
 
                 sample_output = personality_data.get("sample_output", {})
-                trait_scores = sample_output.get("trait_scores", {})
                 docs.append(
                     {
                         "doc_id": "personality::summary",
                         "text": (
                             f"Sample personality summary: {sample_output.get('personality_summary', '')}. "
-                            f"Trait scores example: {json.dumps(trait_scores, ensure_ascii=False)}."
+                            f"Trait scores example: {json.dumps(sample_output.get('trait_scores', {}), ensure_ascii=False)}."
                         ),
-                        "metadata": {
-                            "kind": "personality_summary",
-                            "source": "personality_15_question_dataset",
-                        },
+                        "metadata": {"kind": "personality_summary", "source": "personality_dataset"},
                     }
                 )
             except Exception:
@@ -712,10 +691,6 @@ class BehaviourQuestionnaire:
         return docs
 
     def _infer_personality_rag_from_answers(self, answers: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Maps the stored answers into a weak personality-trait estimate,
-        then enriches it with retrieved benchmark examples.
-        """
         trait_scores: Counter = Counter()
 
         hobby_map = {
@@ -786,6 +761,7 @@ class BehaviourQuestionnaire:
         ).strip()
 
         retrieved = self.rag.retrieve(retrieval_query, top_k=4, min_score=0.02)
+
         retrieved_traits = []
         for item in retrieved:
             trait = item.get("metadata", {}).get("trait")
@@ -813,29 +789,76 @@ class BehaviourQuestionnaire:
             "personality_summary": personality_summary,
         }
 
+    def _load_history_documents(self, user_id: str, user_query: Optional[str] = None) -> List[Dict[str, Any]]:
+        log_path = self._history_log_path(user_id)
+        if not log_path.exists():
+            return []
+
+        documents: List[Dict[str, Any]] = []
+        try:
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return []
+
+        recent_lines = lines[-30:]
+
+        for idx, line in enumerate(recent_lines):
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+
+            query = str(item.get("query", "")).strip()
+            result = item.get("result", {}) or {}
+            answer = (
+                str(result.get("remodeled_english", "")).strip()
+                or str(result.get("raw_english", "")).strip()
+            )
+
+            if not query and not answer:
+                continue
+
+            documents.append(
+                {
+                    "doc_id": f"history::{idx}",
+                    "text": f"Past user query: {query}. Past assistant answer: {answer}.",
+                    "metadata": {"kind": "history", "timestamp": item.get("timestamp", "")},
+                }
+            )
+
+        if user_query and documents:
+            temp_rag = LocalHybridRAG(documents)
+            return temp_rag.retrieve(user_query, top_k=4, min_score=0.05)
+
+        return documents[-4:]
+
     def _profile_to_query(self, profile: Dict[str, Any], user_query: Optional[str] = None) -> str:
         answers = profile.get("answers", {})
         rules = profile.get("behaviour_rules", {})
-        parts = [
-            str(user_query or ""),
-            str(answers.get("life_stage", "")),
-            str(answers.get("food_preference", "")),
-            " ".join(answers.get("health_conditions", [])),
-            str(answers.get("food_caution", "")),
-            str(answers.get("communication_tone", "")),
-            str(answers.get("answer_length", "")),
-            str(answers.get("personality_style", "")),
-            str(answers.get("stress_support", "")),
-            str(answers.get("main_goal", "")),
-            str(answers.get("family_role", "")),
-            " ".join(answers.get("hobbies", [])),
-            " ".join(rules.get("avoid_items", [])),
-            " ".join(rules.get("avoid_topics", [])),
-        ]
-        return " ".join(part for part in parts if part).strip()
+
+        return " ".join(
+            [
+                str(user_query or ""),
+                str(answers.get("life_stage", "")),
+                str(answers.get("food_preference", "")),
+                " ".join(answers.get("health_conditions", [])),
+                str(answers.get("food_caution", "")),
+                str(answers.get("communication_tone", "")),
+                str(answers.get("answer_length", "")),
+                str(answers.get("personality_style", "")),
+                str(answers.get("stress_support", "")),
+                str(answers.get("main_goal", "")),
+                str(answers.get("family_role", "")),
+                " ".join(answers.get("hobbies", [])),
+                " ".join(rules.get("avoid_items", [])),
+                " ".join(rules.get("avoid_topics", [])),
+            ]
+        ).strip()
 
     def build_runtime_context(self, profile: Dict[str, Any], user_query: Optional[str] = None) -> str:
         rules = profile.get("behaviour_rules", {})
+        user_id = profile.get("user_id", "default_user")
+
         notes = "\n- ".join(rules.get("mandatory_notes", []))
         avoid_items = ", ".join(rules.get("avoid_items", [])) or "none"
         avoid_topics = ", ".join(rules.get("avoid_topics", [])) or "none"
@@ -843,6 +866,7 @@ class BehaviourQuestionnaire:
 
         retrieval_query = self._profile_to_query(profile, user_query=user_query)
         retrieved = self.rag.retrieve(retrieval_query, top_k=6, min_score=0.02)
+        history_docs = self._load_history_documents(user_id, user_query=user_query)
 
         retrieved_context_lines: List[str] = []
         for item in retrieved:
@@ -850,6 +874,12 @@ class BehaviourQuestionnaire:
             kind = meta.get("kind", "unknown")
             retrieved_context_lines.append(
                 f"- [{kind}] {item.get('text', '')} (score={item.get('retrieval_score', 0.0)})"
+            )
+
+        history_lines: List[str] = []
+        for item in history_docs:
+            history_lines.append(
+                f"- {item.get('text', '')} (score={item.get('retrieval_score', 0.0)})"
             )
 
         rag_hints = profile.get("rag_personality_hints", {})
@@ -875,6 +905,14 @@ Retrieved personality hints:
 - Top traits: {rag_traits}
 - Summary: {rag_summary}
 
-Retrieved context for personalization:
-{chr(10).join(retrieved_context_lines) if retrieved_context_lines else '- No retrieved context available'}
+Relevant personalization context:
+{chr(10).join(retrieved_context_lines) if retrieved_context_lines else '- No retrieved personalization context'}
+
+Relevant past conversation memory:
+{chr(10).join(history_lines) if history_lines else '- No matching history memory'}
+
+Important behavior instruction:
+- Personalize the answer using the stored profile and relevant memory, but do not expose profile internals.
+- Keep the answer aligned with safety notes and avoid items.
+- If the topic is health-sensitive, avoid overclaiming and keep the answer cautious.
 """.strip()
