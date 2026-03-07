@@ -36,7 +36,7 @@ except Exception:
     PeftModel = None  # type: ignore
     _PEFT_AVAILABLE = False
 
-from config import TRANSLATION_TEMPERATURE
+from config import TRANSLATION_TEMPERATURE, OPENAI_API_KEY, OPENAI_MODEL
 from stage_openai_core import OpenAICore
 
 
@@ -69,7 +69,7 @@ def _looks_like_full_hf_model_dir(model_dir: Path) -> bool:
 
 
 def _pick_best_model_dir(root: Path) -> Path:
-    """Find a folder containing 'best' in its name.
+    """Find a folder containing 'best' in its name, or the root if it's a model dir.
 
     If multiple matches exist, the most recently modified is picked.
     """
@@ -78,6 +78,10 @@ def _pick_best_model_dir(root: Path) -> Path:
             f"Model root folder not found: {root}\n"
             "Expected folder relative to stage_translate.py."
         )
+
+    # First, check if the root itself is a model directory
+    if _looks_like_peft_adapter_dir(root) or _looks_like_full_hf_model_dir(root):
+        return root
 
     candidates: list[Path] = []
 
@@ -94,8 +98,8 @@ def _pick_best_model_dir(root: Path) -> Path:
 
     if not candidates:
         raise FileNotFoundError(
-            f"No folder with 'best' found inside: {root}\n"
-            "Create a subfolder whose name contains 'best' and put the model there."
+            f"No folder with 'best' found inside: {root}, and root is not a model directory.\n"
+            "Create a subfolder whose name contains 'best' and put the model there, or put model files directly in the root."
         )
 
     # Keep only folders that look like a PEFT adapter OR a full HF model.
@@ -127,7 +131,7 @@ class StageTranslator:
 
         self.base_dir = Path(__file__).resolve().parent
         self.tamil_to_theni_root = self.base_dir / "stage_tamil_thenitamil_model"
-        self.theni_to_tamil_root = self.base_dir / "stage_thenitamil_tamil_model"
+        self.theni_to_tamil_root = self.base_dir / "theni_to_normal_model"
 
         self.tamil_to_theni_dir = _pick_best_model_dir(self.tamil_to_theni_root)
         self.theni_to_tamil_dir = _pick_best_model_dir(self.theni_to_tamil_root)
@@ -279,3 +283,56 @@ English text:
             )
 
         return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+
+def main():
+    """Run a simple translation example using StageTranslator."""
+    # Check if API key is set
+    if not OPENAI_API_KEY:
+        print("⚠️  Warning: OPENAI_API_KEY is not set in config.py")
+        print("Please set your OpenAI API key in config.py to use English->Tamil translation")
+        print("Skipping OpenAI translation demo (no API key provided)...")
+        core = None
+    else:
+        core = OpenAICore(api_key=OPENAI_API_KEY, model=OPENAI_MODEL)
+
+    try:
+        translator = StageTranslator(core=core)
+        print("✅ Translator initialized successfully!")
+        print(f"   Device: {translator.device}")
+        print(f"   Tamil->Theni model: {translator.tamil_to_theni_dir.name}")
+        print(f"   Theni->Tamil model: {translator.theni_to_tamil_dir.name}")
+
+        if core:
+            print("\n📝 Running translation pipeline demo...")
+            english_text = "Hello, how are you today?"
+            print(f"\nOriginal English: {english_text}")
+            profile = {"behaviour_rules": {"preferred_tone": "warm and friendly"}}
+
+            print("🔄 Translating English -> Tamil...")
+            tamil_text = translator.english_to_tamil(english_text, profile)
+            print(f"Translated Tamil: {tamil_text}")
+
+            print("🔄 Converting Tamil -> Theni Tamil...")
+            theni_text = translator.tamil_to_thenitamil(tamil_text)
+            print(f"Theni Tamil: {theni_text}")
+
+            print("🔄 Converting Theni Tamil -> Tamil...")
+            back_to_tamil = translator.thenitamil_to_tamil(theni_text)
+            print(f"Back to Tamil: {back_to_tamil}")
+        else:
+            print("\n⏭️  Skipping translation demo (no OpenAI API key)")
+            print("To use the full pipeline, set OPENAI_API_KEY in config.py")
+
+    except FileNotFoundError as e:
+        print(f"❌ Error: {e}")
+        print("\nMake sure the model directories exist:")
+        print("  - stage_tamil_thenitamil_model/best_model/")
+        print("  - theni_to_normal_model/best_model/")
+    except Exception as e:
+        print(f"❌ Error during translation: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
