@@ -1,1 +1,17 @@
 .DS_Store
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+dist/
+build/
+
+# Archives
+*.zip
+
+# OS/editor
+.DS_Store

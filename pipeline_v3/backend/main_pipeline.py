@@ -5,7 +5,7 @@ import json
 import time
 from collections import OrderedDict
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from config import (
     DEBUG,
@@ -45,7 +45,9 @@ class PersonaTamilPipeline:
         if value is None:
             return None
         self._query_cache.move_to_end(key)
-        return dict(value)
+        cached = dict(value)
+        cached["cache_hit"] = "true"
+        return cached
 
     def _set_cached_result(self, user_query: str, result: Dict[str, Any]) -> None:
         if not ENABLE_PIPELINE_CACHE:
@@ -56,16 +58,20 @@ class PersonaTamilPipeline:
         while len(self._query_cache) > PIPELINE_CACHE_SIZE:
             self._query_cache.popitem(last=False)
 
-    def _safe_json(self, value: Any) -> str:
+    @staticmethod
+    def _safe_json(value: Any) -> str:
         try:
             return json.dumps(value, ensure_ascii=False)
         except Exception:
             return json.dumps(str(value), ensure_ascii=False)
 
+    def _profile_context(self, user_query: str) -> str:
+        self.profile = self.behaviour.ensure_profile(self.user_id)
+        return self.behaviour.build_runtime_context(self.profile, user_query=user_query)
+
     def run(self, user_query: str) -> Dict[str, Any]:
         cached = self._get_cached_result(user_query)
         if cached is not None:
-            cached["cache_hit"] = "true"
             return cached
 
         total_start = time.perf_counter()
@@ -73,25 +79,22 @@ class PersonaTamilPipeline:
         stage_notes: List[str] = []
 
         t0 = time.perf_counter()
-        self.profile = self.behaviour.ensure_profile(self.user_id)
-        profile_context = self.behaviour.build_runtime_context(self.profile, user_query=user_query)
+        profile_context = self._profile_context(user_query)
         timings["context_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         t0 = time.perf_counter()
         direct_match = self.remodeler.get_direct_answer_match(user_query)
         timings["direct_match_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
-        core_meta: Dict[str, Any] = {
-            "answer": "",
-            "answer_style": "",
-            "risk_level": "low",
-            "safety_notes": "",
-        }
+        core_meta: Dict[str, Any] = {"answer": "", "answer_style": "", "risk_level": "low", "safety_notes": ""}
         remodel_meta: Dict[str, Any] = {}
         translator_meta: Dict[str, Any] = {}
+        review_meta: Dict[str, Any] = {}
         route_taken = "full_pipeline"
         direct_answer_source = ""
         direct_answer_confidence = ""
+        predicted_label = "unknown"
+        risk_level = "low"
 
         if direct_match and direct_match.confidence >= DIRECT_MATCH_FORCE_THRESHOLD:
             raw_english = direct_match.answer
@@ -100,8 +103,7 @@ class PersonaTamilPipeline:
             direct_answer_source = f"{direct_match.match_type}:{direct_match.query}"
             direct_answer_confidence = f"{direct_match.confidence:.4f}"
             predicted_label = direct_match.label
-            risk_level = "low"
-            stage_notes.append("Used a high-confidence direct answer from the dataset.")
+            stage_notes.append("Used a high-confidence direct answer from the local dataset.")
         else:
             t0 = time.perf_counter()
             core_meta = self.core.answer_user_query_structured(user_query, profile_context)
@@ -122,18 +124,12 @@ class PersonaTamilPipeline:
             predicted_label = str(remodel_meta.get("predicted_label", "unknown"))
             risk_level = str(remodel_meta.get("risk_level") or core_meta.get("risk_level") or "low")
             direct_answer_source = str(remodel_meta.get("direct_answer_source", ""))
-            direct_answer_confidence = (
-                f"{float(remodel_meta.get('direct_answer_confidence', 0.0)):.4f}"
-                if remodel_meta.get("direct_answer_confidence") not in (None, "")
-                else ""
-            )
+            if remodel_meta.get("direct_answer_confidence") not in (None, ""):
+                direct_answer_confidence = f"{float(remodel_meta.get('direct_answer_confidence', 0.0)):.4f}"
 
-            if core_meta.get("safety_notes"):
-                stage_notes.append(str(core_meta.get("safety_notes")))
-            if remodel_meta.get("route_reason"):
-                stage_notes.append(str(remodel_meta.get("route_reason")))
-            if review_meta.get("review_note"):
-                stage_notes.append(str(review_meta.get("review_note")))
+            for note in (core_meta.get("safety_notes"), remodel_meta.get("route_reason"), review_meta.get("review_note")):
+                if str(note or "").strip():
+                    stage_notes.append(str(note).strip())
 
         t0 = time.perf_counter()
         translator_meta = self.translator.english_to_tamil_with_meta(remodeled_english, self.profile)
@@ -160,6 +156,7 @@ class PersonaTamilPipeline:
             "stage_notes": self._safe_json(stage_notes),
             "core_meta": self._safe_json(core_meta),
             "remodel_meta": self._safe_json(remodel_meta),
+            "review_meta": self._safe_json(review_meta),
             "translation_meta": self._safe_json(translator_meta),
             "timings_ms": json.dumps({**timings, "total_ms": total_ms}, ensure_ascii=False),
         }
@@ -185,61 +182,42 @@ def print_debug(result: Dict[str, Any]) -> None:
     print("\n===== PIPELINE VERSION =====")
     print(result.get("pipeline_version", ""))
     print("\n===== RAW ENGLISH =====")
-    print(result["raw_english"])
+    print(result.get("raw_english", ""))
     print("\n===== REMODELED ENGLISH =====")
-    print(result["remodeled_english"])
+    print(result.get("remodeled_english", ""))
     print("\n===== STANDARD TAMIL =====")
-    print(result["tamil_text"])
+    print(result.get("tamil_text", ""))
     print("\n===== THENI TAMIL =====")
-    print(result["theni_tamil_text"])
-
+    print(result.get("theni_tamil_text", ""))
     print("\n===== ROUTE =====")
     print(result.get("route_taken", ""))
-
     if result.get("direct_answer_source"):
         print("\n===== DIRECT ANSWER HIT =====")
-        print(result["direct_answer_source"])
+        print(result.get("direct_answer_source", ""))
         print(f"confidence={result.get('direct_answer_confidence', '')}")
-
     if result.get("predicted_label"):
         print("\n===== PREDICTED LABEL =====")
-        print(result["predicted_label"])
-
+        print(result.get("predicted_label", ""))
     if result.get("risk_level"):
         print("\n===== RISK LEVEL =====")
-        print(result["risk_level"])
-
+        print(result.get("risk_level", ""))
     if result.get("stage_notes"):
         print("\n===== STAGE NOTES =====")
-        print(result["stage_notes"])
-
+        print(result.get("stage_notes", ""))
     if result.get("translation_meta"):
         print("\n===== TRANSLATION META =====")
-        print(result["translation_meta"])
-
+        print(result.get("translation_meta", ""))
     if result.get("timings_ms"):
         print("\n===== STAGE TIMINGS (ms) =====")
-        print(result["timings_ms"])
+        print(result.get("timings_ms", ""))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Persona-aware English -> Tamil -> Theni Tamil pipeline")
     parser.add_argument("--user-id", default=DEFAULT_USER_ID, help="Unique user id for loading/storing profile")
-    parser.add_argument(
-        "--rebuild-profile",
-        action="store_true",
-        help="Force profile recreation by deleting the current user profile first",
-    )
-    parser.add_argument(
-        "--prompt",
-        default=DEFAULT_SINGLE_PROMPT,
-        help="Optional single prompt mode. If provided, the pipeline runs once and exits.",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="When used with --prompt, print the full JSON result instead of only Theni Tamil output.",
-    )
+    parser.add_argument("--rebuild-profile", action="store_true", help="Delete the current user profile and rebuild it")
+    parser.add_argument("--prompt", default=DEFAULT_SINGLE_PROMPT, help="Run the pipeline once for a single prompt")
+    parser.add_argument("--json", action="store_true", help="Print full JSON output for single-prompt mode")
     args = parser.parse_args()
 
     behaviour = BehaviourQuestionnaire()
@@ -250,7 +228,6 @@ def main() -> None:
             print(f"Deleted old profile: {profile_path.name}")
 
     pipeline = PersonaTamilPipeline(args.user_id)
-
     if args.prompt:
         result = pipeline.run(args.prompt)
         if args.json or DEBUG:
@@ -259,24 +236,18 @@ def main() -> None:
             print(result["theni_tamil_text"])
         return
 
-    print("\nPipeline ready. Type your question below.")
-    print("Type 'exit' to quit.\n")
-
     while True:
-        user_query = input("You: ").strip()
-        if not user_query:
-            continue
-        if user_query.lower() in {"exit", "quit"}:
-            print("Goodbye.")
+        try:
+            prompt = input("\nAsk something (type 'exit' to quit): ").strip()
+        except EOFError:
             break
-
-        result = pipeline.run(user_query)
+        if not prompt or prompt.lower() in {"exit", "quit"}:
+            break
+        result = pipeline.run(prompt)
         if DEBUG:
             print_debug(result)
         else:
-            print("\nAssistant (Theni Tamil):")
             print(result["theni_tamil_text"])
-            print()
 
 
 if __name__ == "__main__":
