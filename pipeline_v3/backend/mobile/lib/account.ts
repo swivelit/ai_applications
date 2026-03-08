@@ -1,7 +1,14 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { apiGet, apiPost, apiPut } from "./api";
+import {
+  clearAllStoredAuth,
+  clearStoredProfile,
+  getStoredProfile,
+  setStoredAccessToken,
+  setStoredProfile,
+  setStoredTokenMeta,
+} from "./storage";
 
-const KEY = "user_profile_v2";
+const KEY_COMPAT = "user_profile_v2";
 
 export type LocalUserProfile = {
   userId?: string;
@@ -9,7 +16,6 @@ export type LocalUserProfile = {
   place?: string;
   timezone?: string;
   assistantName?: string;
-  accessToken?: string;
   tokenType?: string;
   expiresAt?: string;
 };
@@ -23,16 +29,18 @@ export type DailyRoutinePayload = {
 };
 
 export async function getProfile(): Promise<LocalUserProfile | null> {
-  const raw = await AsyncStorage.getItem(KEY);
-  return raw ? JSON.parse(raw) : null;
+  return getStoredProfile<LocalUserProfile>();
 }
 
 export async function saveProfile(profile: LocalUserProfile) {
-  await AsyncStorage.setItem(KEY, JSON.stringify(profile));
+  await setStoredProfile(profile);
 }
 
 export async function clearProfile() {
-  await AsyncStorage.removeItem(KEY);
+  await Promise.all([
+    clearStoredProfile(),
+    clearAllStoredAuth(),
+  ]);
 }
 
 export async function createProfileOnBackend(p: LocalUserProfile) {
@@ -48,13 +56,34 @@ export async function createProfileOnBackend(p: LocalUserProfile) {
     userId: user.id,
     timezone: user.timezone || p.timezone || "Asia/Kolkata",
     assistantName: user.assistant_name || p.assistantName || "Ellie",
-    accessToken: user.access_token || "",
     tokenType: user.token_type || "bearer",
     expiresAt: user.expires_at || "",
   };
 
-  await saveProfile(merged);
+  await setStoredProfile(merged);
+  await setStoredAccessToken(user.access_token || "");
+  await setStoredTokenMeta({
+    tokenType: user.token_type || "bearer",
+    expiresAt: user.expires_at || "",
+  });
+
   return merged;
+}
+
+export async function logoutCurrentSession() {
+  try {
+    await apiPost("/auth/logout", {});
+  } finally {
+    await clearProfile();
+  }
+}
+
+export async function logoutAllSessions() {
+  try {
+    await apiPost("/auth/logout-all", {});
+  } finally {
+    await clearProfile();
+  }
 }
 
 export async function submitQuestionnaire(userId: string, payload: DailyRoutinePayload) {

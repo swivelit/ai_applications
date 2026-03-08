@@ -45,6 +45,10 @@ from db import (
     get_user as db_get_user,
     init_db,
     parse_utc_iso,
+    prune_expired_sessions,
+    revoke_all_sessions_for_user,
+    revoke_session,
+    rotate_session,
     save_app_state as db_save_app_state,
     touch_session,
 )
@@ -139,6 +143,14 @@ class ParseDatetimeRequest(BaseModel):
 class PersonalityAnswersIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     answers: Dict[str, Any]
+
+
+class SessionRefreshResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    access_token: str
+    token_type: str
+    expires_at: str
+    user_id: str
 
 
 USER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{3,80}$")
@@ -646,6 +658,57 @@ def ready() -> Dict[str, Any]:
     }
 
 
+@app.post("/auth/refresh", response_model=SessionRefreshResponse)
+def refresh_session(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    raw_token = _extract_bearer_token(authorization)
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    rotated = rotate_session(raw_token)
+    if not rotated:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    return {
+        "access_token": rotated["access_token"],
+        "token_type": "bearer",
+        "expires_at": rotated["expires_at"],
+        "user_id": rotated["user_id"],
+    }
+
+
+@app.post("/auth/logout")
+def logout_session(authorization: Optional[str] = Header(default=None)) -> Dict[str, str]:
+    raw_token = _extract_bearer_token(authorization)
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    session = get_session_by_token(raw_token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    revoke_session(raw_token)
+    return {"message": "Logged out successfully"}
+
+
+@app.post("/auth/logout-all")
+def logout_all_sessions(authorization: Optional[str] = Header(default=None)) -> Dict[str, str]:
+    raw_token = _extract_bearer_token(authorization)
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    session = get_session_by_token(raw_token)
+    if not session or int(session.get("is_revoked") or 0) == 1:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    expires_at = parse_utc_iso(str(session["expires_at"]))
+    if expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Session expired")
+
+    user_id = str(session["user_id"])
+    revoke_all_sessions_for_user(user_id)
+    return {"message": "Logged out from all sessions"}
+
+
 @app.get("/api/questions")
 def get_questions() -> Dict[str, List[Dict[str, Any]]]:
     return {"questions": QUESTIONS}
@@ -1044,12 +1107,14 @@ async def transcribe_and_analyze(
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    deleted = prune_expired_sessions()
     logger.info(
-        "Starting service=%s version=%s debug=%s docs_enabled=%s openai_configured=%s db_ready=%s",
+        "Starting service=%s version=%s debug=%s docs_enabled=%s openai_configured=%s db_ready=%s pruned_sessions=%s",
         APP_NAME,
         PIPELINE_VERSION,
         DEBUG,
         API_DOCS_ENABLED,
         bool(OPENAI_API_KEY and openai_client is not None),
         db_ready(),
+        deleted,
     )

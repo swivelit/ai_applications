@@ -1,5 +1,11 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
+import {
+  getStoredAccessToken,
+  getStoredTokenMeta,
+  setStoredAccessToken,
+  setStoredTokenMeta,
+  clearAllStoredAuth,
+} from "./storage";
 
 const API_BASE: string =
   (Constants.expoConfig?.extra?.API_BASE as string) ||
@@ -12,21 +18,64 @@ const API_KEY: string =
   "";
 
 const REQUEST_TIMEOUT_MS = 30000;
-const PROFILE_STORAGE_KEY = "user_profile_v2";
 
-async function getStoredAccessToken(): Promise<string> {
+function isTokenExpiringSoon(expiresAt?: string): boolean {
+  if (!expiresAt) return false;
+  const t = new Date(expiresAt).getTime();
+  if (!Number.isFinite(t)) return false;
+  return t - Date.now() < 24 * 60 * 60 * 1000;
+}
+
+async function refreshAccessToken(currentToken: string): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
   try {
-    const raw = await AsyncStorage.getItem(PROFILE_STORAGE_KEY);
-    if (!raw) return "";
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.accessToken === "string" ? parsed.accessToken : "";
+    const res = await fetch(`${API_BASE}/auth/refresh`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${currentToken}`,
+        "X-Request-Id": `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      },
+      signal: controller.signal,
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data?.access_token) {
+      throw new Error(data?.detail || "Failed to refresh session");
+    }
+
+    await setStoredAccessToken(data.access_token);
+    await setStoredTokenMeta({
+      tokenType: data.token_type || "bearer",
+      expiresAt: data.expires_at || "",
+    });
+
+    return data.access_token as string;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getUsableAccessToken(): Promise<string> {
+  const token = await getStoredAccessToken();
+  if (!token) return "";
+
+  const meta = await getStoredTokenMeta();
+  if (!meta?.expiresAt || !isTokenExpiringSoon(meta.expiresAt)) {
+    return token;
+  }
+
+  try {
+    return await refreshAccessToken(token);
   } catch {
+    await clearAllStoredAuth();
     return "";
   }
 }
 
 async function buildHeaders(extra?: HeadersInit): Promise<HeadersInit> {
-  const accessToken = await getStoredAccessToken();
+  const accessToken = await getUsableAccessToken();
 
   const base: Record<string, string> = {
     ...(API_KEY ? { "X-API-Key": API_KEY } : {}),

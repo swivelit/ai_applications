@@ -157,9 +157,13 @@ def get_app_state(user_id: str) -> Optional[Dict[str, Any]]:
     return json.loads(row["state_json"])
 
 
+def _hash_token(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
 def create_session(user_id: str, *, ttl_days: int = SESSION_TTL_DAYS) -> Dict[str, str]:
     raw_token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    token_hash = _hash_token(raw_token)
     now = utc_now()
     expires_at = (now + timedelta(days=ttl_days)).replace(microsecond=0)
     now_iso = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -181,7 +185,7 @@ def create_session(user_id: str, *, ttl_days: int = SESSION_TTL_DAYS) -> Dict[st
 
 
 def get_session_by_token(raw_token: str) -> Optional[Dict[str, Any]]:
-    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    token_hash = _hash_token(raw_token)
     with _connect() as conn:
         row = conn.execute(
             """
@@ -195,7 +199,7 @@ def get_session_by_token(raw_token: str) -> Optional[Dict[str, Any]]:
 
 
 def touch_session(raw_token: str) -> None:
-    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    token_hash = _hash_token(raw_token)
     now_iso = utc_now_iso()
     with _WRITE_LOCK, _connect() as conn:
         conn.execute(
@@ -205,9 +209,52 @@ def touch_session(raw_token: str) -> None:
 
 
 def revoke_session(raw_token: str) -> None:
-    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    token_hash = _hash_token(raw_token)
     with _WRITE_LOCK, _connect() as conn:
         conn.execute(
             "UPDATE sessions SET is_revoked = 1 WHERE token_hash = ?",
             (token_hash,),
         )
+
+
+def revoke_all_sessions_for_user(user_id: str) -> None:
+    with _WRITE_LOCK, _connect() as conn:
+        conn.execute(
+            "UPDATE sessions SET is_revoked = 1 WHERE user_id = ?",
+            (user_id,),
+        )
+
+
+def rotate_session(raw_token: str, *, ttl_days: int = SESSION_TTL_DAYS) -> Optional[Dict[str, str]]:
+    session = get_session_by_token(raw_token)
+    if not session:
+        return None
+
+    if int(session.get("is_revoked") or 0) == 1:
+        return None
+
+    expires_at = parse_utc_iso(str(session["expires_at"]))
+    if expires_at <= utc_now():
+        return None
+
+    user_id = str(session["user_id"])
+
+    with _WRITE_LOCK:
+        revoke_session(raw_token)
+        new_session = create_session(user_id, ttl_days=ttl_days)
+
+    return {
+        "user_id": user_id,
+        "access_token": new_session["access_token"],
+        "expires_at": new_session["expires_at"],
+    }
+
+
+def prune_expired_sessions() -> int:
+    now_iso = utc_now_iso()
+    with _WRITE_LOCK, _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM sessions WHERE expires_at <= ? OR is_revoked = 1",
+            (now_iso,),
+        )
+        return int(cur.rowcount or 0)
