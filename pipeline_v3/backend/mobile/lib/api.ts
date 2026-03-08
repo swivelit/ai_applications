@@ -1,3 +1,4 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
 
 const API_BASE: string =
@@ -11,10 +12,25 @@ const API_KEY: string =
   "";
 
 const REQUEST_TIMEOUT_MS = 30000;
+const PROFILE_STORAGE_KEY = "user_profile_v2";
 
-function buildHeaders(extra?: HeadersInit): HeadersInit {
+async function getStoredAccessToken(): Promise<string> {
+  try {
+    const raw = await AsyncStorage.getItem(PROFILE_STORAGE_KEY);
+    if (!raw) return "";
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.accessToken === "string" ? parsed.accessToken : "";
+  } catch {
+    return "";
+  }
+}
+
+async function buildHeaders(extra?: HeadersInit): Promise<HeadersInit> {
+  const accessToken = await getStoredAccessToken();
+
   const base: Record<string, string> = {
     ...(API_KEY ? { "X-API-Key": API_KEY } : {}),
+    ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
     "X-Request-Id": `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
   };
 
@@ -76,7 +92,7 @@ async function withTimeout(input: RequestInfo | URL, init?: RequestInit): Promis
 
 export async function apiGet<T>(path: string): Promise<T> {
   const res = await withTimeout(`${API_BASE}${path}`, {
-    headers: buildHeaders(),
+    headers: await buildHeaders(),
   });
   return parseResponse<T>(res);
 }
@@ -84,7 +100,7 @@ export async function apiGet<T>(path: string): Promise<T> {
 export async function apiPost<T>(path: string, body?: any): Promise<T> {
   const res = await withTimeout(`${API_BASE}${path}`, {
     method: "POST",
-    headers: buildHeaders({
+    headers: await buildHeaders({
       "Content-Type": "application/json",
     }),
     body: body ? JSON.stringify(body) : undefined,
@@ -95,7 +111,7 @@ export async function apiPost<T>(path: string, body?: any): Promise<T> {
 export async function apiPut<T>(path: string, body?: any): Promise<T> {
   const res = await withTimeout(`${API_BASE}${path}`, {
     method: "PUT",
-    headers: buildHeaders({
+    headers: await buildHeaders({
       "Content-Type": "application/json",
     }),
     body: body ? JSON.stringify(body) : undefined,
@@ -106,7 +122,7 @@ export async function apiPut<T>(path: string, body?: any): Promise<T> {
 export async function apiPostForm<T>(path: string, form: FormData): Promise<T> {
   const res = await withTimeout(`${API_BASE}${path}`, {
     method: "POST",
-    headers: buildHeaders(),
+    headers: await buildHeaders(),
     body: form,
   });
   return parseResponse<T>(res);

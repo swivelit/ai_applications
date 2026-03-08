@@ -9,6 +9,9 @@ export type LocalUserProfile = {
   place?: string;
   timezone?: string;
   assistantName?: string;
+  accessToken?: string;
+  tokenType?: string;
+  expiresAt?: string;
 };
 
 export type DailyRoutinePayload = {
@@ -28,6 +31,10 @@ export async function saveProfile(profile: LocalUserProfile) {
   await AsyncStorage.setItem(KEY, JSON.stringify(profile));
 }
 
+export async function clearProfile() {
+  await AsyncStorage.removeItem(KEY);
+}
+
 export async function createProfileOnBackend(p: LocalUserProfile) {
   const user = await apiPost<any>("/users", {
     name: p.name,
@@ -40,6 +47,10 @@ export async function createProfileOnBackend(p: LocalUserProfile) {
     ...p,
     userId: user.id,
     timezone: user.timezone || p.timezone || "Asia/Kolkata",
+    assistantName: user.assistant_name || p.assistantName || "Ellie",
+    accessToken: user.access_token || "",
+    tokenType: user.token_type || "bearer",
+    expiresAt: user.expires_at || "",
   };
 
   await saveProfile(merged);
