@@ -22,9 +22,6 @@ def _ensure_dirs(paths: Iterable[Path]) -> None:
 _ensure_dirs((DATA_DIR, PROFILES_DIR, LOGS_DIR, CACHE_DIR))
 
 
-# ---------------------------------------------------------------------
-# Typed env readers
-# ---------------------------------------------------------------------
 def _env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
@@ -56,9 +53,6 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# ---------------------------------------------------------------------
-# Core app settings
-# ---------------------------------------------------------------------
 OPENAI_API_KEY = _env_str("OPENAI_API_KEY", "")
 OPENAI_MODEL = _env_str("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_TIMEOUT = _env_int("OPENAI_TIMEOUT", 60)
@@ -67,28 +61,37 @@ OPENAI_CACHE_SIZE = _env_int("OPENAI_CACHE_SIZE", 128)
 OPENAI_BACKOFF_BASE_SECONDS = _env_float("OPENAI_BACKOFF_BASE_SECONDS", 1.0)
 
 APP_NAME = _env_str("APP_NAME", "persona_tamil_pipeline")
+PIPELINE_VERSION = _env_str("PIPELINE_VERSION", "v4")
 DEFAULT_USER_ID = _env_str("DEFAULT_USER_ID", "demo_user")
 DEFAULT_SINGLE_PROMPT = _env_str("DEFAULT_SINGLE_PROMPT", "")
 DEBUG = _env_bool("DEBUG", False)
 LOG_LEVEL = _env_str("LOG_LEVEL", "INFO")
 
 RAW_TEMPERATURE = _env_float("RAW_TEMPERATURE", 0.35)
-REMODEL_TEMPERATURE = _env_float("REMODEL_TEMPERATURE", 0.45)
-TRANSLATION_TEMPERATURE = _env_float("TRANSLATION_TEMPERATURE", 0.15)
-THENI_TEMPERATURE = _env_float("THENI_TEMPERATURE", 0.15)
+REMODEL_TEMPERATURE = _env_float("REMODEL_TEMPERATURE", 0.40)
+TRANSLATION_TEMPERATURE = _env_float("TRANSLATION_TEMPERATURE", 0.12)
 
-PROFILE_VERSION = _env_str("PROFILE_VERSION", "v2")
+PROFILE_VERSION = _env_str("PROFILE_VERSION", "v3")
 QUESTION_COUNT = _env_int("QUESTION_COUNT", 15)
 MAX_HISTORY_DOCS = _env_int("MAX_HISTORY_DOCS", 8)
-MAX_PROFILE_MEMORY_ROWS = _env_int("MAX_PROFILE_MEMORY_ROWS", 50)
 
 DIRECT_MATCH_STRONG_THRESHOLD = _env_float("DIRECT_MATCH_STRONG_THRESHOLD", 0.90)
 DIRECT_MATCH_SEMANTIC_THRESHOLD = _env_float("DIRECT_MATCH_SEMANTIC_THRESHOLD", 0.84)
 DIRECT_MATCH_WEAK_THRESHOLD = _env_float("DIRECT_MATCH_WEAK_THRESHOLD", 0.76)
+DIRECT_MATCH_FORCE_THRESHOLD = _env_float("DIRECT_MATCH_FORCE_THRESHOLD", 0.92)
+DIRECT_MATCH_ROUTE_THRESHOLD = _env_float("DIRECT_MATCH_ROUTE_THRESHOLD", 0.84)
 
 ENABLE_STAGE_FALLBACKS = _env_bool("ENABLE_STAGE_FALLBACKS", True)
 ENABLE_PIPELINE_CACHE = _env_bool("ENABLE_PIPELINE_CACHE", True)
 PIPELINE_CACHE_SIZE = _env_int("PIPELINE_CACHE_SIZE", 64)
+ENABLE_TRANSLATION_REFINEMENT = _env_bool("ENABLE_TRANSLATION_REFINEMENT", True)
+ENABLE_TAMIL_VALIDATION = _env_bool("ENABLE_TAMIL_VALIDATION", True)
+ENABLE_ANSWER_REVIEW = _env_bool("ENABLE_ANSWER_REVIEW", True)
+
+REMODEL_MIN_OUTPUT_CHARS = _env_int("REMODEL_MIN_OUTPUT_CHARS", 20)
+REMODEL_MIN_SIMILARITY_TO_RAW = _env_float("REMODEL_MIN_SIMILARITY_TO_RAW", 0.42)
+MIN_TAMIL_CHAR_RATIO = _env_float("MIN_TAMIL_CHAR_RATIO", 0.18)
+TRANSLATION_RETRY_ON_NON_TAMIL = _env_bool("TRANSLATION_RETRY_ON_NON_TAMIL", True)
 
 TAMIL_TO_THENI_MODEL_ROOT = Path(
     _env_str("TAMIL_TO_THENI_MODEL_ROOT", str(BASE_DIR / "stage_tamil_thenitamil_model"))

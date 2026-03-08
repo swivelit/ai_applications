@@ -5,7 +5,7 @@ import math
 import re
 import string
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,18 +16,16 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 
 from config import (
+    DIRECT_MATCH_ROUTE_THRESHOLD,
     DIRECT_MATCH_SEMANTIC_THRESHOLD,
     DIRECT_MATCH_STRONG_THRESHOLD,
     DIRECT_MATCH_WEAK_THRESHOLD,
     HEALTH_RISK_KEYWORDS,
+    REMODEL_MIN_OUTPUT_CHARS,
+    REMODEL_MIN_SIMILARITY_TO_RAW,
     REMODEL_TEMPERATURE,
 )
 from stage_openai_core import OpenAICore
-
-
-# ---------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------
 
 
 def _normalize_text(text: Any) -> str:
@@ -58,11 +56,6 @@ def _sequence_similarity(text1: str, text2: str) -> float:
 
 
 def _coerce_csv_rows(path: Path) -> pd.DataFrame:
-    """Load broken CSVs where answers contain unquoted commas.
-
-    Expected logical columns are: text, label, answer.
-    If extra commas exist, everything after the label is merged back into answer.
-    """
     rows: List[Dict[str, str]] = []
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.reader(handle)
@@ -71,9 +64,7 @@ def _coerce_csv_rows(path: Path) -> pd.DataFrame:
             return pd.DataFrame(columns=["text", "label", "answer"])
 
         for raw_row in reader:
-            if not raw_row:
-                continue
-            if len(raw_row) < 2:
+            if not raw_row or len(raw_row) < 2:
                 continue
             text = raw_row[0].strip()
             label = raw_row[1].strip() if len(raw_row) > 1 else ""
@@ -92,41 +83,28 @@ class DirectAnswerMatch:
     match_type: str
 
 
-# ---------------------------------------------------------------------
-# Classifier + direct answer engine
-# ---------------------------------------------------------------------
+@dataclass
+class RoutingDecision:
+    route: str
+    reason: str
+    direct_match: Optional[DirectAnswerMatch]
+    predicted_label: str
+    label_probs: Dict[str, float]
+    health_sensitive: bool
+    raw_quality_score: float
 
 
 class EmbeddedTextClassifier:
-    """TF-IDF classifier + multi-strategy direct answer retrieval."""
-
     def __init__(self, dataset_path: Optional[str] = None) -> None:
         self.dataset_path = dataset_path or self._resolve_dataset_path()
-
-        self.vectorizer = TfidfVectorizer(
-            ngram_range=(1, 3),
-            min_df=1,
-            sublinear_tf=True,
-        )
+        self.vectorizer = TfidfVectorizer(ngram_range=(1, 3), min_df=1, sublinear_tf=True)
         self.model = LogisticRegression(max_iter=3000, class_weight="balanced")
-
-        self.qa_vectorizer = TfidfVectorizer(
-            ngram_range=(1, 3),
-            min_df=1,
-            sublinear_tf=True,
-        )
+        self.qa_vectorizer = TfidfVectorizer(ngram_range=(1, 3), min_df=1, sublinear_tf=True)
         self.qa_matrix = None
-
-        self.is_trained = False
-        self.train_accuracy: Optional[float] = None
-        self.test_accuracy: Optional[float] = None
-        self.label_distribution: Dict[str, int] = {}
-        self.raw_dataset: Optional[pd.DataFrame] = None
-        self.dataset_summary: Dict[str, Any] = {}
-
-        self.direct_answer_map: Dict[str, DirectAnswerMatch] = {}
         self.qa_records: List[Dict[str, str]] = []
-
+        self.direct_answer_map: Dict[str, DirectAnswerMatch] = {}
+        self.raw_dataset: Optional[pd.DataFrame] = None
+        self.is_trained = False
         self._train()
 
     def _resolve_dataset_path(self) -> str:
@@ -140,14 +118,7 @@ class EmbeddedTextClassifier:
         for path in possible_paths:
             if path.exists():
                 return str(path)
-
-        raise FileNotFoundError(
-            "Could not find classifier dataset. Expected one of:\n"
-            "- data/classifier_dataset.csv\n"
-            "- classifier_dataset.csv\n"
-            "- data/dataset.csv\n"
-            "- dataset.csv"
-        )
+        raise FileNotFoundError("Could not find classifier dataset.")
 
     @staticmethod
     def preprocess(text: Any) -> str:
@@ -161,9 +132,7 @@ class EmbeddedTextClassifier:
             data = _coerce_csv_rows(path)
 
         if "text" not in data.columns or "label" not in data.columns:
-            raise ValueError(
-                f"Dataset at {self.dataset_path} must contain 'text' and 'label' columns."
-            )
+            raise ValueError("Dataset must contain 'text' and 'label' columns.")
 
         if "answer" not in data.columns:
             data["answer"] = ""
@@ -179,24 +148,14 @@ class EmbeddedTextClassifier:
     def _train(self) -> None:
         data = self._load_dataset()
         self.raw_dataset = data.copy()
-        self.label_distribution = data["label"].value_counts().to_dict()
-        self.dataset_summary = {
-            "rows": int(len(data)),
-            "labels": sorted(map(str, data["label"].unique().tolist())),
-            "has_answers": int((data["answer"].str.strip() != "").sum()),
-        }
 
-        self.direct_answer_map = {}
         self.qa_records = []
-
+        self.direct_answer_map = {}
         for _, row in data.iterrows():
-            text = row["text"].strip()
-            clean_text = row["clean_text"].strip()
-            label = row["label"].strip()
-            answer = row["answer"].strip()
-            if not text or not clean_text:
-                continue
-
+            text = str(row["text"]).strip()
+            clean_text = str(row["clean_text"]).strip()
+            label = str(row["label"]).strip()
+            answer = str(row["answer"]).strip()
             if answer:
                 match = DirectAnswerMatch(
                     query=text,
@@ -222,14 +181,11 @@ class EmbeddedTextClassifier:
         if len(data) < 3 or data["label"].nunique() < 2:
             X = self.vectorizer.fit_transform(data["clean_text"])
             self.model.fit(X, data["label"])
-            self.train_accuracy = 1.0
-            self.test_accuracy = None
             self.is_trained = True
             return
 
         label_counts = data["label"].value_counts()
         stratify_labels = data["label"] if label_counts.min() >= 2 else None
-
         X_train, X_test, y_train, y_test = train_test_split(
             data["clean_text"],
             data["label"],
@@ -237,27 +193,17 @@ class EmbeddedTextClassifier:
             random_state=42,
             stratify=stratify_labels,
         )
-
         X_train_tfidf = self.vectorizer.fit_transform(X_train)
-        X_test_tfidf = self.vectorizer.transform(X_test)
-
         self.model.fit(X_train_tfidf, y_train)
-        self.train_accuracy = float(self.model.score(X_train_tfidf, y_train))
-        self.test_accuracy = float(self.model.score(X_test_tfidf, y_test))
         self.is_trained = True
 
     def predict(self, text: str) -> str:
-        if not self.is_trained:
-            raise RuntimeError("Classifier is not trained.")
         cleaned_text = self.preprocess(text)
         input_vector = self.vectorizer.transform([cleaned_text])
         prediction = self.model.predict(input_vector)[0]
         return str(prediction)
 
     def predict_proba_map(self, text: str) -> Dict[str, float]:
-        if not self.is_trained:
-            raise RuntimeError("Classifier is not trained.")
-
         cleaned_text = self.preprocess(text)
         input_vector = self.vectorizer.transform([cleaned_text])
 
@@ -351,73 +297,17 @@ class EmbeddedTextClassifier:
 
         return None
 
-    def get_direct_answer(self, text: str) -> Optional[str]:
-        match = self.get_direct_answer_match(text)
-        return match.answer if match else None
-
-
-# ---------------------------------------------------------------------
-# Advanced local RAG
-# ---------------------------------------------------------------------
-
 
 class AdvancedLocalRAG:
     def __init__(self, documents: List[Dict[str, Any]]) -> None:
         self.documents = documents or []
-        self.stopwords = {
-            "a", "an", "the", "and", "or", "but", "if", "to", "for", "of", "in", "on",
-            "at", "by", "with", "from", "as", "is", "are", "was", "were", "be", "been",
-            "this", "that", "these", "those", "it", "its", "into", "about", "your", "you",
-            "user", "question", "answer", "profile", "assistant", "most", "best", "usually",
-            "right", "now", "how", "what", "which", "when", "do", "does", "can", "should",
-            "would", "could", "one", "two", "three", "only",
-        }
-        self.synonyms = {
-            "greeting": ["hi", "hello", "vanakkam", "hey"],
-            "health": ["wellness", "medical", "diet", "safe", "safety"],
-            "food": ["meal", "eat", "diet", "snack", "recipe"],
-            "urgent": ["emergency", "immediately", "danger", "severe"],
-            "career": ["job", "work", "business", "professional"],
-            "short": ["brief", "direct", "concise"],
-            "detailed": ["explain", "structured", "steps"],
-            "pregnancy": ["pregnant", "postpartum", "breastfeeding", "conceive"],
-            "sugar": ["diabetes", "sweet", "glucose"],
-        }
         self.vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=1, sublinear_tf=True)
-        self.doc_texts = [self._normalize(doc.get("text", "")) for doc in self.documents]
-        self.doc_tokens = [self._tokenize(text) for text in self.doc_texts]
+        self.doc_texts = [_normalize_text(doc.get("text", "")) for doc in self.documents]
         self.doc_matrix = self.vectorizer.fit_transform(self.doc_texts) if self.doc_texts else None
 
     @staticmethod
-    def _normalize(text: Any) -> str:
-        return _normalize_text(text)
-
-    def _tokenize(self, text: Any) -> List[str]:
-        normalized = self._normalize(text)
-        return [t for t in normalized.split() if t and t not in self.stopwords]
-
-    def _expand_query(self, query: str) -> str:
-        tokens = self._tokenize(query)
-        expanded = list(tokens)
-        token_set = set(tokens)
-
-        for token in list(tokens):
-            if token in self.synonyms:
-                expanded.extend(self.synonyms[token])
-
-        for key, values in self.synonyms.items():
-            if token_set.intersection(values):
-                expanded.append(key)
-                expanded.extend(values)
-
-        return " ".join(expanded)
-
-    @staticmethod
-    def _jaccard(tokens1: List[str], tokens2: List[str]) -> float:
-        s1, s2 = set(tokens1), set(tokens2)
-        if not s1 or not s2:
-            return 0.0
-        return len(s1 & s2) / max(len(s1 | s2), 1)
+    def _jaccard(text1: str, text2: str) -> float:
+        return _jaccard_similarity(text1, text2)
 
     @staticmethod
     def _cosine_dense(v1, v2) -> float:
@@ -427,83 +317,28 @@ class AdvancedLocalRAG:
             return 0.0
         return numerator / denom
 
-    def retrieve(
-        self,
-        query: str,
-        *,
-        top_k: int = 6,
-        predicted_label: Optional[str] = None,
-        label_probs: Optional[Dict[str, float]] = None,
-        mmr_lambda: float = 0.80,
-        min_score: float = 0.03,
-    ) -> List[Dict[str, Any]]:
+    def retrieve(self, query: str, top_k: int = 6, min_score: float = 0.03) -> List[Dict[str, Any]]:
         if not self.documents or self.doc_matrix is None:
             return []
 
-        expanded_query = self._expand_query(query)
-        query_vec = self.vectorizer.transform([expanded_query])
-        query_tokens = self._tokenize(expanded_query)
+        cleaned_query = _normalize_text(query)
+        query_vec = self.vectorizer.transform([cleaned_query])
 
-        scored: List[Tuple[int, float]] = []
+        results: List[Tuple[int, float]] = []
         for idx, doc in enumerate(self.documents):
             semantic = self._cosine_dense(query_vec, self.doc_matrix[idx])
-            lexical = self._jaccard(query_tokens, self.doc_tokens[idx])
-            meta = doc.get("metadata", {})
-            label = str(meta.get("label", ""))
-            kind = str(meta.get("kind", ""))
-            label_boost = 0.0
-            kind_boost = 0.0
-
-            if predicted_label and label and label == predicted_label:
-                label_boost += 0.08
-            if label_probs and label:
-                label_boost += 0.10 * float(label_probs.get(label, 0.0))
-            if kind in {"profile_rule", "label_summary", "profile_summary", "health_rule"}:
-                kind_boost += 0.03
-            if kind == "dataset_direct_answer":
-                kind_boost += 0.04
-
-            score = (0.66 * semantic) + (0.20 * lexical) + label_boost + kind_boost
+            lexical = self._jaccard(cleaned_query, self.doc_texts[idx])
+            score = (0.72 * semantic) + (0.28 * lexical)
             if score >= min_score:
-                scored.append((idx, score))
+                results.append((idx, score))
 
-        if not scored:
-            return []
-
-        scored.sort(key=lambda item: item[1], reverse=True)
-        candidate_indices = [idx for idx, _ in scored[: max(top_k * 3, top_k)]]
-        selected: List[int] = []
-        selected_results: List[Dict[str, Any]] = []
-
-        while candidate_indices and len(selected) < top_k:
-            best_idx = None
-            best_mmr = -1e9
-            for idx in list(candidate_indices):
-                relevance = next(score for cand_idx, score in scored if cand_idx == idx)
-                diversity_penalty = 0.0
-                if selected:
-                    diversity_penalty = max(self._cosine_dense(self.doc_matrix[idx], self.doc_matrix[s_idx]) for s_idx in selected)
-                mmr_score = (mmr_lambda * relevance) - ((1 - mmr_lambda) * diversity_penalty)
-                if mmr_score > best_mmr:
-                    best_mmr = mmr_score
-                    best_idx = idx
-
-            if best_idx is None:
-                break
-
-            selected.append(best_idx)
-            candidate_indices.remove(best_idx)
-            original_score = next(score for cand_idx, score in scored if cand_idx == best_idx)
-            result = dict(self.documents[best_idx])
-            result["retrieval_score"] = round(float(original_score), 4)
-            selected_results.append(result)
-
-        return selected_results
-
-
-# ---------------------------------------------------------------------
-# English remodeler
-# ---------------------------------------------------------------------
+        results.sort(key=lambda item: item[1], reverse=True)
+        output: List[Dict[str, Any]] = []
+        for idx, score in results[:top_k]:
+            item = dict(self.documents[idx])
+            item["retrieval_score"] = round(float(score), 4)
+            output.append(item)
+        return output
 
 
 class EnglishRemodeler:
@@ -512,162 +347,62 @@ class EnglishRemodeler:
         self.classifier = EmbeddedTextClassifier(dataset_path=dataset_path)
         self.dataset_path = self.classifier.dataset_path
         self.rag = AdvancedLocalRAG(self._build_rag_documents())
-        self._remodel_cache: Dict[Tuple[str, str, str], str] = {}
-
-    def get_direct_answer_match(self, user_query: str) -> Optional[DirectAnswerMatch]:
-        return self.classifier.get_direct_answer_match(user_query)
-
-    def has_direct_answer(self, user_query: str) -> bool:
-        return self.get_direct_answer_match(user_query) is not None
-
-    def get_direct_answer(self, user_query: str) -> Optional[str]:
-        match = self.get_direct_answer_match(user_query)
-        return match.answer if match else None
-
-    def _load_dataset(self) -> pd.DataFrame:
-        return self.classifier._load_dataset()
+        self._remodel_cache: "OrderedDict[Tuple[str, str, str], Dict[str, Any]]" = OrderedDict()
 
     def _build_rag_documents(self) -> List[Dict[str, Any]]:
         docs: List[Dict[str, Any]] = []
-        data = self._load_dataset()
-
-        label_examples: Dict[str, List[str]] = defaultdict(list)
-        label_answers: Dict[str, List[str]] = defaultdict(list)
+        data = self.classifier._load_dataset()
 
         for idx, row in data.iterrows():
-            text = str(row["text"]).strip()
-            label = str(row["label"]).strip()
-            answer = str(row["answer"]).strip()
+            text = str(row.get("text", "")).strip()
+            label = str(row.get("label", "")).strip()
+            answer = str(row.get("answer", "")).strip()
 
-            docs.append(
-                {
-                    "doc_id": f"dataset::{idx}",
-                    "text": f"User example query: {text}. Label: {label}.",
-                    "metadata": {"kind": "dataset_example", "label": label},
-                }
-            )
-            label_examples[label].append(text)
-
+            if text:
+                docs.append(
+                    {
+                        "doc_id": f"dataset::query::{idx}",
+                        "text": f"Dataset example query: {text}. Query label: {label}.",
+                        "metadata": {"kind": "dataset_query", "label": label},
+                    }
+                )
             if answer:
                 docs.append(
                     {
-                        "doc_id": f"dataset_answer::{idx}",
-                        "text": f"Known query-answer pair. Query: {text}. Stored answer: {answer}. Label: {label}.",
+                        "doc_id": f"dataset::answer::{idx}",
+                        "text": f"Dataset answer for label {label}. User intent: {text}. Suggested answer: {answer}.",
                         "metadata": {"kind": "dataset_direct_answer", "label": label},
                     }
                 )
-                label_answers[label].append(answer)
-
-        for label, examples in label_examples.items():
-            docs.append(
-                {
-                    "doc_id": f"label_summary::{label}",
-                    "text": (
-                        f"Label {label} summary. Representative queries: {' | '.join(examples[:8])}. "
-                        f"Representative answers: {' | '.join(label_answers.get(label, [])[:4])}. "
-                        f"This label has {len(examples)} examples."
-                    ),
-                    "metadata": {"kind": "label_summary", "label": label},
-                }
-            )
 
         docs.extend(
             [
                 {
+                    "doc_id": "rule::faithful_rewrite",
+                    "text": "When rewriting, preserve meaning, keep useful structure, and do not add unsupported claims.",
+                    "metadata": {"kind": "rewrite_rule", "label": "general"},
+                },
+                {
                     "doc_id": "rule::health_safety",
-                    "text": (
-                        "For health-related queries, rewrite cautiously. Do not prescribe medicine. Do not overclaim. "
-                        "Suggest qualified medical support for diagnosis, emergencies, severe symptoms, pregnancy-related risk, diabetes, "
-                        "blood pressure, allergy, kidney concerns, or medication changes."
-                    ),
-                    "metadata": {"kind": "health_rule", "label": "safety"},
+                    "text": "For health, pregnancy, medicine, diabetes, blood pressure, allergies, kidney issues, or emergencies, be cautious, avoid diagnosis-like certainty, and suggest a clinician for medication or urgent concerns.",
+                    "metadata": {"kind": "health_rule", "label": "health"},
                 },
                 {
-                    "doc_id": "rule::faithfulness",
-                    "text": (
-                        "Remodeling must preserve the meaning of the raw answer. Improve clarity, grammar, structure, and personalization, "
-                        "but do not invent facts."
-                    ),
-                    "metadata": {"kind": "profile_rule", "label": "faithfulness"},
-                },
-                {
-                    "doc_id": "rule::tone_length",
-                    "text": (
-                        "Assistant should align wording to the user's preferred tone and answer length. "
-                        "Possible tone preferences include warm, respectful, short direct, detailed, and friendly casual."
-                    ),
-                    "metadata": {"kind": "profile_rule", "label": "tone"},
+                    "doc_id": "rule::style",
+                    "text": "Prefer concise, natural English that stays practical and aligned with the user's tone and answer-length preference.",
+                    "metadata": {"kind": "style_rule", "label": "general"},
                 },
             ]
         )
         return docs
 
+    def get_direct_answer_match(self, user_query: str) -> Optional[DirectAnswerMatch]:
+        return self.classifier.get_direct_answer_match(user_query)
+
     @staticmethod
     def _safe_join(items: List[str], default: str = "none") -> str:
         cleaned = [str(item).strip() for item in items if str(item).strip()]
         return ", ".join(cleaned) if cleaned else default
-
-    def _extract_profile_snippets(self, profile: Dict[str, Any]) -> List[Dict[str, Any]]:
-        answers = profile.get("answers", {}) or {}
-        rules = profile.get("behaviour_rules", {}) or {}
-        snippets: List[Dict[str, Any]] = []
-
-        def add(doc_id: str, text: str, kind: str = "profile_rule", label: str = "profile") -> None:
-            snippets.append({"doc_id": doc_id, "text": text, "metadata": {"kind": kind, "label": label}})
-
-        add("profile::summary", f"Stored profile summary: {profile.get('profile_summary', '')}", kind="profile_summary")
-        add(
-            "profile::tone_length",
-            f"Preferred tone is {rules.get('preferred_tone', 'warm and clear')}. Preferred answer length is {rules.get('preferred_answer_length', '1-2 paragraphs')}.",
-        )
-        add(
-            "profile::avoid",
-            f"Avoid items: {self._safe_join(rules.get('avoid_items', []))}. Avoid topics: {self._safe_join(rules.get('avoid_topics', []))}.",
-        )
-        add("profile::mandatory_notes", f"Mandatory notes: {self._safe_join(rules.get('mandatory_notes', []))}.")
-        add("profile::style_bias", f"Response style bias: {self._safe_join(rules.get('response_style_bias', []))}.")
-
-        rag_hints = profile.get("rag_personality_hints", {}) or {}
-        if rag_hints:
-            add(
-                "profile::personality_hints",
-                f"Retrieved personality hints: top traits are {self._safe_join(rag_hints.get('top_traits', []))}. {rag_hints.get('personality_summary', '')}",
-                kind="profile_personality",
-            )
-
-        add(
-            "profile::answers",
-            (
-                f"Life stage: {answers.get('life_stage', '')}. Food preference: {answers.get('food_preference', '')}. "
-                f"Health conditions: {self._safe_join(answers.get('health_conditions', []))}. Food caution: {answers.get('food_caution', '')}. "
-                f"Personality style: {answers.get('personality_style', '')}. Stress support: {answers.get('stress_support', '')}. "
-                f"Communication tone: {answers.get('communication_tone', '')}. Answer length: {answers.get('answer_length', '')}. "
-                f"Hobbies: {self._safe_join(answers.get('hobbies', []))}. Main goal: {answers.get('main_goal', '')}. Family role: {answers.get('family_role', '')}."
-            ),
-            kind="profile_answers",
-        )
-        return snippets
-
-    def _build_runtime_rag(self, profile: Dict[str, Any], raw_answer: str) -> AdvancedLocalRAG:
-        runtime_docs = list(self.rag.documents)
-        runtime_docs.extend(self._extract_profile_snippets(profile))
-        runtime_docs.append(
-            {
-                "doc_id": "runtime::raw_answer",
-                "text": f"Raw answer to preserve faithfully: {raw_answer}",
-                "metadata": {"kind": "raw_answer", "label": "raw_answer"},
-            }
-        )
-        return AdvancedLocalRAG(runtime_docs)
-
-    def _format_retrieved_docs(self, docs: List[Dict[str, Any]]) -> str:
-        if not docs:
-            return "- No retrieved grounding snippets found."
-        lines = []
-        for item in docs:
-            meta = item.get("metadata", {})
-            lines.append(f"- [{meta.get('kind', 'unknown')}] {item.get('text', '')} (score={item.get('retrieval_score', 0.0)})")
-        return "\n".join(lines)
 
     @staticmethod
     def _is_health_sensitive(text: str, profile: Dict[str, Any]) -> bool:
@@ -684,28 +419,131 @@ class EnglishRemodeler:
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text
 
-    def remodel(self, user_query: str, raw_answer: str, profile: Dict[str, Any]) -> str:
+    def _estimate_answer_quality(self, answer: str) -> float:
+        answer = str(answer or "").strip()
+        if not answer:
+            return 0.0
+        length_score = min(len(answer) / 180.0, 1.0)
+        has_structure = 1.0 if any(token in answer for token in ["\n", ":", "1.", "- "]) else 0.4
+        sentence_like = 1.0 if re.search(r"[.!?]", answer) else 0.5
+        return round((0.45 * length_score) + (0.30 * has_structure) + (0.25 * sentence_like), 4)
+
+    def decide_route(self, user_query: str, raw_answer: str, profile: Dict[str, Any]) -> RoutingDecision:
         direct_match = self.get_direct_answer_match(user_query)
-        if direct_match and direct_match.confidence >= DIRECT_MATCH_SEMANTIC_THRESHOLD:
-            return direct_match.answer
-
-        profile_summary = profile.get("profile_summary", "")
-        rules = profile.get("behaviour_rules", {}) or {}
-        cache_key = (_normalize_text(user_query), _normalize_text(raw_answer), _normalize_text(profile_summary))
-        cached = self._remodel_cache.get(cache_key)
-        if cached:
-            return cached
-
         try:
-            query_label = self.classifier.predict(user_query)
+            predicted_label = self.classifier.predict(user_query)
         except Exception:
-            query_label = "unknown"
-
+            predicted_label = "unknown"
         try:
             label_probs = self.classifier.predict_proba_map(user_query)
         except Exception:
-            label_probs = {query_label: 1.0} if query_label != "unknown" else {}
+            label_probs = {predicted_label: 1.0} if predicted_label != "unknown" else {}
 
+        health_sensitive = self._is_health_sensitive(f"{user_query} {raw_answer}", profile)
+        raw_quality_score = self._estimate_answer_quality(raw_answer)
+
+        if direct_match and direct_match.confidence >= DIRECT_MATCH_STRONG_THRESHOLD:
+            return RoutingDecision(
+                route="direct_answer",
+                reason="high-confidence direct match from dataset",
+                direct_match=direct_match,
+                predicted_label=predicted_label,
+                label_probs=label_probs,
+                health_sensitive=health_sensitive,
+                raw_quality_score=raw_quality_score,
+            )
+
+        if health_sensitive:
+            return RoutingDecision(
+                route="careful_rewrite",
+                reason="health-sensitive request needs conservative polish",
+                direct_match=direct_match,
+                predicted_label=predicted_label,
+                label_probs=label_probs,
+                health_sensitive=health_sensitive,
+                raw_quality_score=raw_quality_score,
+            )
+
+        if raw_quality_score >= 0.72:
+            return RoutingDecision(
+                route="light_rewrite",
+                reason="raw answer is already decent; use light polish",
+                direct_match=direct_match,
+                predicted_label=predicted_label,
+                label_probs=label_probs,
+                health_sensitive=health_sensitive,
+                raw_quality_score=raw_quality_score,
+            )
+
+        if direct_match and direct_match.confidence >= DIRECT_MATCH_ROUTE_THRESHOLD:
+            return RoutingDecision(
+                route="direct_answer",
+                reason="semantic direct match is strong enough",
+                direct_match=direct_match,
+                predicted_label=predicted_label,
+                label_probs=label_probs,
+                health_sensitive=health_sensitive,
+                raw_quality_score=raw_quality_score,
+            )
+
+        return RoutingDecision(
+            route="full_rewrite",
+            reason="use retrieval-grounded rewrite",
+            direct_match=direct_match,
+            predicted_label=predicted_label,
+            label_probs=label_probs,
+            health_sensitive=health_sensitive,
+            raw_quality_score=raw_quality_score,
+        )
+
+    def _guard_answer(self, raw_answer: str, remodeled_answer: str, routing: RoutingDecision) -> str:
+        raw_answer = self._post_process_answer(raw_answer)
+        remodeled_answer = self._post_process_answer(remodeled_answer)
+
+        if routing.direct_match and routing.direct_match.confidence >= DIRECT_MATCH_ROUTE_THRESHOLD:
+            return routing.direct_match.answer
+
+        if not remodeled_answer:
+            return raw_answer
+
+        if len(remodeled_answer) < REMODEL_MIN_OUTPUT_CHARS and raw_answer:
+            return raw_answer
+
+        if raw_answer:
+            similarity = (0.55 * _jaccard_similarity(raw_answer, remodeled_answer)) + (
+                0.45 * _sequence_similarity(raw_answer, remodeled_answer)
+            )
+            if similarity < REMODEL_MIN_SIMILARITY_TO_RAW:
+                return raw_answer
+
+        return remodeled_answer
+
+    def remodel_with_meta(self, user_query: str, raw_answer: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+        profile_summary = profile.get("profile_summary", "")
+        cache_key = (_normalize_text(user_query), _normalize_text(raw_answer), _normalize_text(profile_summary))
+        cached = self._remodel_cache.get(cache_key)
+        if cached is not None:
+            self._remodel_cache.move_to_end(cache_key)
+            return dict(cached)
+
+        routing = self.decide_route(user_query, raw_answer, profile)
+
+        if routing.route == "direct_answer" and routing.direct_match is not None:
+            result = {
+                "answer": routing.direct_match.answer,
+                "route": routing.route,
+                "route_reason": routing.reason,
+                "predicted_label": routing.predicted_label,
+                "label_probs": routing.label_probs,
+                "risk_level": "high" if routing.health_sensitive else "low",
+                "direct_answer_source": f"{routing.direct_match.match_type}:{routing.direct_match.query}",
+                "direct_answer_confidence": round(float(routing.direct_match.confidence), 4),
+                "retrieved_docs": [],
+            }
+            self._remodel_cache[cache_key] = dict(result)
+            return result
+
+        rules = profile.get("behaviour_rules", {}) or {}
         retrieval_query = " ".join(
             [
                 user_query,
@@ -717,28 +555,21 @@ class EnglishRemodeler:
                 " ".join(rules.get("avoid_topics", []) or []),
                 " ".join(rules.get("mandatory_notes", []) or []),
                 " ".join(rules.get("response_style_bias", []) or []),
-                query_label,
+                routing.predicted_label,
             ]
         ).strip()
 
-        runtime_rag = self._build_runtime_rag(profile, raw_answer)
-        retrieved_docs = runtime_rag.retrieve(
-            retrieval_query,
-            top_k=8,
-            predicted_label=query_label,
-            label_probs=label_probs,
-            min_score=0.02,
-        )
+        retrieved_docs = self.rag.retrieve(retrieval_query, top_k=8, min_score=0.02)
 
-        health_sensitive = self._is_health_sensitive(user_query + " " + raw_answer, profile)
         schema = {
             "type": "object",
             "properties": {
                 "answer": {"type": "string"},
                 "applied_tone": {"type": "string"},
                 "risk_level": {"type": "string", "enum": ["low", "medium", "high"]},
+                "rewrite_intensity": {"type": "string", "enum": ["light", "medium", "strong"]},
             },
-            "required": ["answer", "applied_tone", "risk_level"],
+            "required": ["answer", "applied_tone", "risk_level", "rewrite_intensity"],
             "additionalProperties": False,
         }
 
@@ -755,11 +586,16 @@ User question:
 Raw English answer:
 {raw_answer}
 
+Routing decision:
+- route: {routing.route}
+- reason: {routing.reason}
+- health-sensitive: {'yes' if routing.health_sensitive else 'no'}
+
 Predicted query class:
-{query_label}
+{routing.predicted_label}
 
 Predicted class probabilities:
-{label_probs}
+{routing.label_probs}
 
 Stored profile summary:
 {profile_summary}
@@ -773,10 +609,9 @@ Behavior rules:
 - Response style bias: {self._safe_join(rules.get('response_style_bias', []))}
 
 Retrieved grounding snippets:
-{self._format_retrieved_docs(retrieved_docs)}
+{chr(10).join([f"- {item.get('text', '')}" for item in retrieved_docs])}
 
 Additional guidance:
-- Health-sensitive topic: {'yes' if health_sensitive else 'no'}
 - If health-sensitive, stay cautious and avoid risky or diagnosis-like statements.
 - If the answer is already strong, improve wording without changing substance.
 - Prefer concise faithfulness over creativity.
@@ -792,14 +627,31 @@ Additional guidance:
             max_output_tokens=1000,
         )
 
-        answer = self._post_process_answer(data.get("answer", ""))
-        if not answer:
-            answer = self._post_process_answer(raw_answer)
+        candidate_answer = self._post_process_answer(data.get("answer", "")) or self._post_process_answer(raw_answer)
+        final_answer = self._guard_answer(raw_answer, candidate_answer, routing)
 
-        weak_direct_match = self.get_direct_answer_match(user_query)
-        if weak_direct_match and weak_direct_match.confidence >= DIRECT_MATCH_WEAK_THRESHOLD:
-            # When a near-direct match exists, keep the stored answer as the single source of truth.
-            answer = weak_direct_match.answer
+        result = {
+            "answer": final_answer,
+            "route": routing.route,
+            "route_reason": routing.reason,
+            "predicted_label": routing.predicted_label,
+            "label_probs": routing.label_probs,
+            "risk_level": str(data.get("risk_level", "high" if routing.health_sensitive else "low")),
+            "direct_answer_source": "",
+            "direct_answer_confidence": round(float(routing.direct_match.confidence), 4) if routing.direct_match else 0.0,
+            "retrieved_docs": [
+                {
+                    "doc_id": item.get("doc_id", ""),
+                    "kind": item.get("metadata", {}).get("kind", ""),
+                    "score": item.get("retrieval_score", 0.0),
+                }
+                for item in retrieved_docs
+            ],
+            "rewrite_intensity": str(data.get("rewrite_intensity", "medium")),
+            "applied_tone": str(data.get("applied_tone", rules.get("preferred_tone", ""))),
+        }
+        self._remodel_cache[cache_key] = dict(result)
+        return result
 
-        self._remodel_cache[cache_key] = answer
-        return answer
+    def remodel(self, user_query: str, raw_answer: str, profile: Dict[str, Any]) -> str:
+        return str(self.remodel_with_meta(user_query, raw_answer, profile).get("answer", "")).strip()

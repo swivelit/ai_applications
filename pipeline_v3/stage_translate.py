@@ -1,15 +1,3 @@
-"""stage_translate.py
-
-Advanced translation stage.
-
-What changed:
-- graceful fallback when local dialect models are missing
-- chunk-aware translation for longer responses
-- Tamil detection to avoid unnecessary retranslating
-- local dialect conversion is now optional instead of hard-failing pipeline startup
-- basic Tamil cleanup/post-processing
-"""
-
 from __future__ import annotations
 
 import gc
@@ -32,9 +20,13 @@ from config import (
     DIALECT_MODEL_MAX_LENGTH,
     DIALECT_MODEL_NUM_BEAMS,
     ENABLE_STAGE_FALLBACKS,
+    ENABLE_TAMIL_VALIDATION,
+    ENABLE_TRANSLATION_REFINEMENT,
+    MIN_TAMIL_CHAR_RATIO,
     TAMIL_TO_THENI_MODEL_ROOT,
     THENI_TO_TAMIL_MODEL_ROOT,
     TRANSLATION_MAX_CHUNK_CHARS,
+    TRANSLATION_RETRY_ON_NON_TAMIL,
     TRANSLATION_TEMPERATURE,
 )
 from stage_openai_core import OpenAICore
@@ -98,8 +90,6 @@ def _pick_best_model_dir(root: Path) -> Optional[Path]:
 
 
 class StageTranslator:
-    """English -> Tamil via OpenAI, plus optional Tamil <-> Theni Tamil local models."""
-
     def __init__(
         self,
         core: Optional[OpenAICore] = None,
@@ -111,7 +101,6 @@ class StageTranslator:
         self.max_length = max_length
         self.num_beams = num_beams
 
-        self.base_dir = Path(__file__).resolve().parent
         self.tamil_to_theni_root = TAMIL_TO_THENI_MODEL_ROOT
         self.theni_to_tamil_root = THENI_TO_TAMIL_MODEL_ROOT
 
@@ -127,12 +116,6 @@ class StageTranslator:
     @staticmethod
     def _contains_tamil(text: str) -> bool:
         return bool(re.search(r"[\u0B80-\u0BFF]", str(text or "")))
-
-    @staticmethod
-    def _normalize_whitespace(text: str) -> str:
-        text = str(text or "").strip()
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
 
     @staticmethod
     def _cleanup_tamil(text: str) -> str:
@@ -170,6 +153,20 @@ class StageTranslator:
             chunks.append(current)
         return chunks
 
+    @staticmethod
+    def _tamil_char_ratio(text: str) -> float:
+        text = str(text or "")
+        if not text:
+            return 0.0
+        tamil_chars = sum(1 for ch in text if "\u0B80" <= ch <= "\u0BFF")
+        alpha_num_chars = sum(1 for ch in text if ch.isalnum()) or len(text)
+        return tamil_chars / max(alpha_num_chars, 1)
+
+    def _looks_like_valid_tamil_output(self, text: str) -> bool:
+        if not ENABLE_TAMIL_VALIDATION:
+            return True
+        return self._contains_tamil(text) and self._tamil_char_ratio(text) >= MIN_TAMIL_CHAR_RATIO
+
     def _load_tokenizer_if_available(self) -> Optional[MBart50Tokenizer]:
         for candidate in (self.tamil_to_theni_dir, self.theni_to_tamil_dir):
             if candidate is None:
@@ -201,10 +198,7 @@ class StageTranslator:
 
         if _looks_like_peft_adapter_dir(model_dir):
             if not _PEFT_AVAILABLE:
-                raise RuntimeError(
-                    "The dialect model folder looks like a PEFT/LoRA adapter, but 'peft' is not installed."
-                )
-
+                raise RuntimeError("PEFT model found but 'peft' is not installed.")
             base_model = MBartForConditionalGeneration.from_pretrained(BASE_MODEL_NAME, torch_dtype=dtype)
             model = PeftModel.from_pretrained(base_model, str(model_dir), local_files_only=True)  # type: ignore
             model = model.merge_and_unload()  # type: ignore
@@ -228,36 +222,16 @@ class StageTranslator:
             self._tamil_to_theni_model = self._load_local_model(self.tamil_to_theni_dir)
         return self._tamil_to_theni_model
 
-    def _ensure_theni_to_tamil_model(self) -> Optional[MBartForConditionalGeneration]:
-        if self.theni_to_tamil_dir is None:
-            return None
-        if self._theni_to_tamil_model is None:
-            self._theni_to_tamil_model = self._load_local_model(self.theni_to_tamil_dir)
-        return self._theni_to_tamil_model
-
-    # ---------------------------------------------------------------------
-    # OpenAI translation (English -> Tamil)
-    # ---------------------------------------------------------------------
-    def english_to_tamil(self, english_text: str, profile: Dict[str, Any]) -> str:
-        if not english_text or self._contains_tamil(english_text):
-            return self._cleanup_tamil(english_text)
-
+    def _translate_chunk(self, english_text: str, tone: str, answer_length: str) -> str:
         if self.core is None:
-            raise RuntimeError("OpenAICore was not provided. Pass OpenAICore() to StageTranslator(core=...).")
-
-        rules = profile.get("behaviour_rules", {}) or {}
-        tone = rules.get("preferred_tone", "warm and clear")
-        answer_length = rules.get("preferred_answer_length", "1-2 balanced paragraphs")
-        chunks = self._split_into_chunks(english_text)
-        outputs: List[str] = []
+            raise RuntimeError("OpenAICore was not provided.")
 
         system_prompt = (
             "You are an expert English-to-Tamil translator. Translate into natural, modern, easy-to-read Tamil. "
-            "Preserve meaning, tone, safety, and answer structure. Do not over-Sanskritize. Do not transliterate English unless necessary for brand names or technical terms."
+            "Preserve meaning, tone, safety, and answer structure. Do not over-Sanskritize. "
+            "Do not transliterate English unless necessary."
         )
-
-        for chunk in chunks:
-            user_prompt = f"""
+        user_prompt = f"""
 Preferred tone:
 {tone}
 
@@ -270,22 +244,112 @@ Preserve headings, lists, and practical structure.
 Output only Tamil text.
 
 English text:
-{chunk}
+{english_text}
 """.strip()
-            outputs.append(
-                self.core.generate_text(
-                    system_prompt,
-                    user_prompt,
-                    temperature=TRANSLATION_TEMPERATURE,
-                    max_output_tokens=1200,
-                )
-            )
+        return self.core.generate_text(
+            system_prompt,
+            user_prompt,
+            temperature=TRANSLATION_TEMPERATURE,
+            max_output_tokens=1200,
+        )
 
-        return self._cleanup_tamil("\n\n".join(outputs))
+    def _retry_translate_chunk(self, english_text: str) -> str:
+        if self.core is None:
+            return english_text
+        system_prompt = (
+            "Translate English into pure Tamil script as much as naturally possible. "
+            "Return only Tamil text, keeping the meaning unchanged."
+        )
+        user_prompt = f"Translate this into Tamil only:\n\n{english_text}"
+        return self.core.generate_text(
+            system_prompt,
+            user_prompt,
+            temperature=0.05,
+            max_output_tokens=1200,
+        )
 
-    # ---------------------------------------------------------------------
-    # Local dialect conversion
-    # ---------------------------------------------------------------------
+    def _refine_combined_tamil(self, tamil_text: str, tone: str, answer_length: str) -> str:
+        if self.core is None or not tamil_text:
+            return tamil_text
+        system_prompt = (
+            "You are a Tamil editor. Improve fluency, readability, and consistency without changing the meaning. "
+            "Preserve headings, lists, and safety wording."
+        )
+        user_prompt = f"""
+Target tone:
+{tone}
+
+Target answer-length feel:
+{answer_length}
+
+Polish the Tamil below while preserving the exact meaning.
+Output only Tamil text.
+
+Tamil text:
+{tamil_text}
+""".strip()
+        return self.core.generate_text(
+            system_prompt,
+            user_prompt,
+            temperature=0.08,
+            max_output_tokens=1400,
+        )
+
+    def english_to_tamil_with_meta(self, english_text: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned_english = str(english_text or "").strip()
+        if not cleaned_english:
+            return {
+                "tamil_text": "",
+                "source": "empty",
+                "chunk_count": 0,
+                "refinement_applied": False,
+                "validation_passed": True,
+            }
+
+        if self._contains_tamil(cleaned_english):
+            cleaned = self._cleanup_tamil(cleaned_english)
+            return {
+                "tamil_text": cleaned,
+                "source": "passthrough",
+                "chunk_count": 1,
+                "refinement_applied": False,
+                "validation_passed": self._looks_like_valid_tamil_output(cleaned),
+            }
+
+        rules = profile.get("behaviour_rules", {}) or {}
+        tone = rules.get("preferred_tone", "warm and clear")
+        answer_length = rules.get("preferred_answer_length", "1-2 balanced paragraphs")
+        chunks = self._split_into_chunks(cleaned_english)
+        outputs: List[str] = []
+
+        for chunk in chunks:
+            translated = self._cleanup_tamil(self._translate_chunk(chunk, tone=tone, answer_length=answer_length))
+            if TRANSLATION_RETRY_ON_NON_TAMIL and not self._looks_like_valid_tamil_output(translated):
+                retry_text = self._cleanup_tamil(self._retry_translate_chunk(chunk))
+                if self._looks_like_valid_tamil_output(retry_text):
+                    translated = retry_text
+            outputs.append(translated)
+
+        combined = self._cleanup_tamil("\n\n".join(outputs))
+        refinement_applied = False
+
+        if ENABLE_TRANSLATION_REFINEMENT and (len(chunks) > 1 or not self._looks_like_valid_tamil_output(combined)):
+            refined = self._cleanup_tamil(self._refine_combined_tamil(combined, tone=tone, answer_length=answer_length))
+            if refined:
+                combined = refined
+                refinement_applied = True
+
+        return {
+            "tamil_text": combined,
+            "source": "openai",
+            "chunk_count": len(chunks),
+            "refinement_applied": refinement_applied,
+            "validation_passed": self._looks_like_valid_tamil_output(combined),
+        }
+
+    def english_to_tamil(self, english_text: str, profile: Dict[str, Any]) -> str:
+        return str(self.english_to_tamil_with_meta(english_text, profile).get("tamil_text", "")).strip()
+
     def tamil_to_thenitamil(self, tamil_text: str) -> str:
         tamil_text = self._cleanup_tamil(tamil_text)
         if not tamil_text:
@@ -299,27 +363,12 @@ English text:
         converted = [self._generate(chunk, model) for chunk in chunks]
         return self._cleanup_tamil("\n\n".join(converted))
 
-    def thenitamil_to_tamil(self, theni_tamil_text: str) -> str:
-        theni_tamil_text = self._cleanup_tamil(theni_tamil_text)
-        if not theni_tamil_text:
-            return theni_tamil_text
-
-        model = self._ensure_theni_to_tamil_model()
-        if model is None or self.tokenizer is None:
-            return theni_tamil_text if ENABLE_STAGE_FALLBACKS else self._raise_missing_model("Theni Tamil -> Tamil")
-
-        chunks = self._split_into_chunks(theni_tamil_text)
-        converted = [self._generate(chunk, model) for chunk in chunks]
-        return self._cleanup_tamil("\n\n".join(converted))
-
     @staticmethod
     def _raise_missing_model(direction: str) -> str:
         raise FileNotFoundError(f"Local dialect model unavailable for {direction} conversion.")
 
     def _generate(self, text: str, model: MBartForConditionalGeneration) -> str:
-        if not text:
-            return text
-        if self.tokenizer is None:
+        if not text or self.tokenizer is None:
             return text
 
         self.tokenizer.src_lang = SRC_LANG
