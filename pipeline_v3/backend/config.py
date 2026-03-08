@@ -57,6 +57,11 @@ def _env_float(name: str, default: float, *, minimum: Optional[float] = None) ->
     return parsed
 
 
+def _env_csv(name: str, default: str = "") -> list[str]:
+    raw = os.getenv(name, default)
+    return [item.strip() for item in str(raw).split(",") if item.strip()]
+
+
 OPENAI_API_KEY = _env_str("OPENAI_API_KEY", "")
 OPENAI_MODEL = _env_str("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_TIMEOUT = _env_int("OPENAI_TIMEOUT", 60, minimum=5)
@@ -116,6 +121,20 @@ THENI_TO_TAMIL_MODEL_ROOT = Path(
 )
 DIALECT_MODEL_MAX_LENGTH = _env_int("DIALECT_MODEL_MAX_LENGTH", 160, minimum=16)
 DIALECT_MODEL_NUM_BEAMS = _env_int("DIALECT_MODEL_NUM_BEAMS", 5, minimum=1)
+
+# ---- API / operational settings ----
+
+API_HOST = _env_str("API_HOST", "0.0.0.0")
+API_PORT = _env_int("API_PORT", 8000, minimum=1)
+API_DOCS_ENABLED = _env_bool("API_DOCS_ENABLED", True)
+
+API_KEY = _env_str("API_KEY", "")
+API_CORS_ORIGINS = _env_csv("API_CORS_ORIGINS", "http://localhost:3000,http://localhost:8081")
+API_RATE_LIMIT_REQUESTS = _env_int("API_RATE_LIMIT_REQUESTS", 60, minimum=1)
+API_RATE_LIMIT_WINDOW_SECONDS = _env_int("API_RATE_LIMIT_WINDOW_SECONDS", 60, minimum=1)
+MAX_MESSAGE_CHARS = _env_int("MAX_MESSAGE_CHARS", 4000, minimum=100)
+MAX_AUDIO_UPLOAD_BYTES = _env_int("MAX_AUDIO_UPLOAD_BYTES", 12 * 1024 * 1024, minimum=1024)
+APP_STATE_MAX_BYTES = _env_int("APP_STATE_MAX_BYTES", 256 * 1024, minimum=1024)
 
 PREGNANCY_CUSTOM_AVOID_LIST = [
     "pineapple",

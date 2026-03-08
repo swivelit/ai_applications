@@ -1,18 +1,42 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import tempfile
+import threading
+import time
 import uuid
+from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
-from config import OPENAI_API_KEY
+from config import (
+    API_CORS_ORIGINS,
+    API_DOCS_ENABLED,
+    API_KEY,
+    API_RATE_LIMIT_REQUESTS,
+    API_RATE_LIMIT_WINDOW_SECONDS,
+    APP_NAME,
+    APP_STATE_MAX_BYTES,
+    DEBUG,
+    LOG_LEVEL,
+    MAX_AUDIO_UPLOAD_BYTES,
+    MAX_MESSAGE_CHARS,
+    OPENAI_API_KEY,
+    OPENAI_MAX_RETRIES,
+    OPENAI_MODEL,
+    OPENAI_TIMEOUT,
+    PIPELINE_VERSION,
+)
 from main_pipeline import PersonaTamilPipeline
 from stage_behaviour_questions import BehaviourQuestionnaire, QUESTIONS
 
@@ -23,29 +47,54 @@ except Exception:
 
 
 # -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(APP_NAME)
+
+
+# -----------------------------------------------------------------------------
 # App setup
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="Persona Tamil Mobile API", version="2.0.0")
+app = FastAPI(
+    title="Persona Tamil Mobile API",
+    version=PIPELINE_VERSION,
+    docs_url="/docs" if API_DOCS_ENABLED else None,
+    redoc_url="/redoc" if API_DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if API_DOCS_ENABLED else None,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=API_CORS_ORIGINS or [],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-Id"],
 )
 
 behaviour = BehaviourQuestionnaire()
 PIPELINE_CACHE: Dict[str, PersonaTamilPipeline] = {}
+PIPELINE_CACHE_LOCK = threading.RLock()
 
 DATA_ROOT = Path(__file__).resolve().parent / "data"
 APP_STATE_DIR = DATA_ROOT / "app_state"
 APP_STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+PROFILE_FILE_LOCKS: dict[str, threading.Lock] = {}
+PROFILE_FILE_LOCKS_GUARD = threading.Lock()
+
 openai_client = None
 if OPENAI_API_KEY and OpenAI is not None:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    openai_client = OpenAI(
+        api_key=OPENAI_API_KEY,
+        timeout=OPENAI_TIMEOUT,
+        max_retries=OPENAI_MAX_RETRIES,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -53,41 +102,48 @@ if OPENAI_API_KEY and OpenAI is not None:
 # -----------------------------------------------------------------------------
 
 class ChatRequest(BaseModel):
-    user_id: str = Field(..., min_length=1)
-    message: str = Field(..., min_length=1)
+    model_config = ConfigDict(extra="forbid")
+    user_id: str = Field(..., min_length=3, max_length=80)
+    message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARS)
 
 
 class SaveProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     answers: Dict[str, Any]
 
 
 class ProfileResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     exists: bool
     profile: Optional[Dict[str, Any]] = None
 
 
 class CreateUserRequest(BaseModel):
-    name: str
-    place: Optional[str] = None
-    timezone: str = "Asia/Kolkata"
-    assistant_name: str = "Ellie"
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(..., min_length=1, max_length=120)
+    place: Optional[str] = Field(default=None, max_length=120)
+    timezone: str = Field(default="Asia/Kolkata", min_length=1, max_length=64)
+    assistant_name: str = Field(default="Ellie", min_length=1, max_length=60)
 
 
 class DailyRoutineIn(BaseModel):
-    wake_time: str
-    sleep_time: str
-    work_start: Optional[str] = None
-    work_end: Optional[str] = None
-    daily_habits: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+    wake_time: str = Field(..., min_length=5, max_length=5)
+    sleep_time: str = Field(..., min_length=5, max_length=5)
+    work_start: Optional[str] = Field(default=None, max_length=5)
+    work_end: Optional[str] = Field(default=None, max_length=5)
+    daily_habits: Optional[str] = Field(default=None, max_length=1000)
 
 
 class ParseDatetimeRequest(BaseModel):
-    text: str
-    timezone: str = "Asia/Kolkata"
-    now_iso: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(..., min_length=1, max_length=500)
+    timezone: str = Field(default="Asia/Kolkata", min_length=1, max_length=64)
+    now_iso: Optional[str] = Field(default=None, max_length=64)
 
 
 class PersonalityAnswersIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     answers: Dict[str, Any]
 
 
@@ -95,19 +151,38 @@ class PersonalityAnswersIn(BaseModel):
 # Helpers
 # -----------------------------------------------------------------------------
 
-def get_pipeline(user_id: str) -> PersonaTamilPipeline:
-    user_id = (user_id or "").strip()
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
+USER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{3,80}$")
+HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
-    if user_id not in PIPELINE_CACHE:
-        PIPELINE_CACHE[user_id] = PersonaTamilPipeline(user_id=user_id)
-    return PIPELINE_CACHE[user_id]
+
+def sanitize_user_id(user_id: str) -> str:
+    value = str(user_id or "").strip()
+    if not USER_ID_RE.fullmatch(value):
+        raise HTTPException(status_code=400, detail="Invalid user_id")
+    return value
+
+
+def get_profile_lock(user_id: str) -> threading.Lock:
+    with PROFILE_FILE_LOCKS_GUARD:
+        lock = PROFILE_FILE_LOCKS.get(user_id)
+        if lock is None:
+            lock = threading.Lock()
+            PROFILE_FILE_LOCKS[user_id] = lock
+        return lock
+
+
+def get_pipeline(user_id: str) -> PersonaTamilPipeline:
+    user_id = sanitize_user_id(user_id)
+    with PIPELINE_CACHE_LOCK:
+        if user_id not in PIPELINE_CACHE:
+            PIPELINE_CACHE[user_id] = PersonaTamilPipeline(user_id=user_id)
+        return PIPELINE_CACHE[user_id]
 
 
 def reset_pipeline(user_id: str) -> None:
-    if user_id in PIPELINE_CACHE:
-        del PIPELINE_CACHE[user_id]
+    user_id = sanitize_user_id(user_id)
+    with PIPELINE_CACHE_LOCK:
+        PIPELINE_CACHE.pop(user_id, None)
 
 
 def try_parse_json(value: Any) -> Any:
@@ -147,53 +222,77 @@ def normalize_pipeline_result(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def app_state_path(user_id: str) -> Path:
-    safe = "".join(ch for ch in (user_id or "").strip() if ch.isalnum() or ch in {"_", "-"})
-    if not safe:
-        raise HTTPException(status_code=400, detail="Invalid user_id")
-    return APP_STATE_DIR / f"{safe}.json"
+    safe_user_id = sanitize_user_id(user_id)
+    return APP_STATE_DIR / f"{safe_user_id}.json"
+
+
+def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    data = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+    if len(data) > APP_STATE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="App state too large")
+
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix=path.stem, suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(tmp_fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
 
 def load_app_state(user_id: str) -> Dict[str, Any]:
+    user_id = sanitize_user_id(user_id)
     path = app_state_path(user_id)
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {
-        "user_id": user_id,
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "profile": {
-            "name": "",
-            "place": "",
-            "timezone": "Asia/Kolkata",
-            "assistant_name": "Ellie",
-        },
-        "daily_routine": {
-            "wake_time": "07:30",
-            "sleep_time": "23:30",
-            "work_start": "09:30",
-            "work_end": "18:30",
-            "daily_habits": "",
-        },
-    }
+    lock = get_profile_lock(user_id)
+    with lock:
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning("Failed to read app state for %s: %s", user_id, exc)
+
+        return {
+            "user_id": user_id,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "profile": {
+                "name": "",
+                "place": "",
+                "timezone": "Asia/Kolkata",
+                "assistant_name": "Ellie",
+            },
+            "daily_routine": {
+                "wake_time": "07:30",
+                "sleep_time": "23:30",
+                "work_start": "09:30",
+                "work_end": "18:30",
+                "daily_habits": "",
+            },
+        }
 
 
 def save_app_state(user_id: str, state: Dict[str, Any]) -> None:
+    user_id = sanitize_user_id(user_id)
     path = app_state_path(user_id)
-    path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    lock = get_profile_lock(user_id)
+    with lock:
+        _write_json_atomic(path, state)
 
 
 def normalize_optional(v: Optional[str]) -> Optional[str]:
     if v is None:
         return None
-    v = str(v).strip()
-    return v if v else None
+    value = str(v).strip()
+    return value if value else None
 
 
 def validate_hhmm(v: str) -> None:
-    import re
-    if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", str(v or "").strip()):
+    if not HHMM_RE.match(str(v or "").strip()):
         raise HTTPException(status_code=400, detail=f"Invalid time format: {v}")
 
 
@@ -247,7 +346,7 @@ def build_profile_from_answers(
 
     profile = {
         "profile_version": "app_created",
-        "user_id": user_id,
+        "user_id": sanitize_user_id(user_id),
         "created_at": datetime.utcnow().isoformat() + "Z",
         "answers": answers,
         "behaviour_rules": behaviour_rules,
@@ -263,6 +362,7 @@ def build_profile_from_answers(
 
 
 def ensure_pipeline_profile_exists(user_id: str) -> Dict[str, Any]:
+    user_id = sanitize_user_id(user_id)
     state = load_app_state(user_id)
 
     if behaviour.profile_exists(user_id):
@@ -296,7 +396,7 @@ def ensure_pipeline_profile_exists(user_id: str) -> Dict[str, Any]:
 def require_openai() -> Any:
     if openai_client is None:
         raise HTTPException(
-            status_code=500,
+            status_code=503,
             detail="OPENAI_API_KEY is missing or OpenAI client is unavailable.",
         )
     return openai_client
@@ -328,7 +428,7 @@ Rules:
 """
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=OPENAI_MODEL,
         temperature=0.0,
         response_format={"type": "json_object"},
         messages=[
@@ -389,7 +489,7 @@ Rules:
 """
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=OPENAI_MODEL,
         temperature=0.2,
         response_format={"type": "json_object"},
         messages=[
@@ -418,56 +518,209 @@ Rules:
     return {"checkins": cleaned[:8]}
 
 
+def verify_api_key(x_api_key: Optional[str]) -> None:
+    if not API_KEY:
+        return
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 # -----------------------------------------------------------------------------
-# Core health + pipeline endpoints
+# Rate limiter
+# -----------------------------------------------------------------------------
+
+class InMemoryRateLimiter:
+    def __init__(self, max_requests: int, window_seconds: int) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._events: dict[str, Deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def hit(self, key: str) -> tuple[bool, int]:
+        now = time.time()
+        with self._lock:
+            events = self._events[key]
+            while events and (now - events[0]) > self.window_seconds:
+                events.popleft()
+
+            if len(events) >= self.max_requests:
+                retry_after = max(1, int(self.window_seconds - (now - events[0])))
+                return False, retry_after
+
+            events.append(now)
+            return True, 0
+
+
+rate_limiter = InMemoryRateLimiter(
+    max_requests=API_RATE_LIMIT_REQUESTS,
+    window_seconds=API_RATE_LIMIT_WINDOW_SECONDS,
+)
+
+
+# -----------------------------------------------------------------------------
+# Middleware / exception handling
+# -----------------------------------------------------------------------------
+
+@app.middleware("http")
+async def add_request_context(request: Request, call_next):
+    start = time.perf_counter()
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    request.state.request_id = request_id
+
+    client_host = request.client.host if request.client else "unknown"
+    limiter_key = f"{client_host}:{request.url.path}"
+    allowed, retry_after = rate_limiter.hit(limiter_key)
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": "Too many requests",
+                "request_id": request_id,
+            },
+            headers={
+                "Retry-After": str(retry_after),
+                "X-Request-Id": request_id,
+            },
+        )
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("Unhandled server error request_id=%s path=%s", request_id, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": "Internal server error",
+                "request_id": request_id,
+            },
+            headers={"X-Request-Id": request_id},
+        )
+
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    response.headers["X-Request-Id"] = request_id
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+
+    logger.info(
+        "request_id=%s method=%s path=%s status=%s duration_ms=%s",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    request_id = getattr(request.state, "request_id", "")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "request_id": request_id},
+        headers={"X-Request-Id": request_id} if request_id else None,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    request_id = getattr(request.state, "request_id", "")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "Validation error",
+            "errors": exc.errors(),
+            "request_id": request_id,
+        },
+        headers={"X-Request-Id": request_id} if request_id else None,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Core health + readiness endpoints
 # -----------------------------------------------------------------------------
 
 @app.get("/")
 def root() -> Dict[str, str]:
-    return {"status": "ok", "message": "Persona Tamil Mobile API"}
+    return {
+        "status": "ok",
+        "service": APP_NAME,
+        "version": PIPELINE_VERSION,
+    }
+
 
 @app.get("/health")
 def health_root() -> Dict[str, str]:
     return {"status": "ok"}
 
+
 @app.get("/api/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready() -> Dict[str, Any]:
+    return {
+        "status": "ready",
+        "service": APP_NAME,
+        "version": PIPELINE_VERSION,
+        "openai_configured": bool(OPENAI_API_KEY and openai_client is not None),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Questions + profile endpoints
+# -----------------------------------------------------------------------------
 
 @app.get("/api/questions")
 def get_questions() -> Dict[str, List[Dict[str, Any]]]:
     return {"questions": QUESTIONS}
 
+
 @app.get("/personality/questions")
 def get_personality_questions() -> Dict[str, Any]:
     return {"version": 1, "questions": QUESTIONS}
 
+
 @app.get("/api/profile/{user_id}", response_model=ProfileResponse)
-def get_profile(user_id: str) -> ProfileResponse:
+def get_profile(user_id: str, x_api_key: Optional[str] = Header(default=None)) -> ProfileResponse:
+    verify_api_key(x_api_key)
+    user_id = sanitize_user_id(user_id)
     try:
         if not behaviour.profile_exists(user_id):
             ensure_pipeline_profile_exists(user_id)
         profile = behaviour.load_profile(user_id)
         return ProfileResponse(exists=True, profile=profile)
+    except HTTPException:
+        raise
     except Exception as exc:
+        logger.exception("Failed to load profile user_id=%s", user_id)
         raise HTTPException(status_code=500, detail=f"Failed to load profile: {exc}")
 
-@app.post("/api/profile/{user_id}")
-def save_profile(user_id: str, payload: SaveProfileRequest) -> Dict[str, Any]:
-    try:
-        if not user_id.strip():
-            raise HTTPException(status_code=400, detail="user_id is required")
 
-        state = load_app_state(user_id.strip())
-        existing = behaviour.load_profile(user_id.strip()) if behaviour.profile_exists(user_id.strip()) else None
+@app.post("/api/profile/{user_id}")
+def save_profile(
+    user_id: str,
+    payload: SaveProfileRequest,
+    x_api_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
+    user_id = sanitize_user_id(user_id)
+
+    try:
+        state = load_app_state(user_id)
+        existing = behaviour.load_profile(user_id) if behaviour.profile_exists(user_id) else None
         profile = build_profile_from_answers(
-            user_id.strip(),
+            user_id,
             payload.answers or {},
             existing_profile=existing,
             app_state=state,
         )
-        behaviour.save_profile(user_id.strip(), profile)
-        reset_pipeline(user_id.strip())
+        behaviour.save_profile(user_id, profile)
+        reset_pipeline(user_id)
 
         return {
             "message": "Profile saved successfully",
@@ -476,10 +729,15 @@ def save_profile(user_id: str, payload: SaveProfileRequest) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
+        logger.exception("Failed to save profile user_id=%s", user_id)
         raise HTTPException(status_code=500, detail=f"Failed to save profile: {exc}")
 
+
 @app.post("/api/profile/{user_id}/reset")
-def reset_profile(user_id: str) -> Dict[str, str]:
+def reset_profile(user_id: str, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, str]:
+    verify_api_key(x_api_key)
+    user_id = sanitize_user_id(user_id)
+
     try:
         path = behaviour._profile_path(user_id)
         if path.exists():
@@ -487,20 +745,31 @@ def reset_profile(user_id: str) -> Dict[str, str]:
         reset_pipeline(user_id)
         return {"message": "Profile reset successfully"}
     except Exception as exc:
+        logger.exception("Failed to reset profile user_id=%s", user_id)
         raise HTTPException(status_code=500, detail=f"Failed to reset profile: {exc}")
 
+
 @app.post("/api/chat")
-def chat(payload: ChatRequest) -> Dict[str, Any]:
+def chat(payload: ChatRequest, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
+    user_id = sanitize_user_id(payload.user_id)
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
     try:
-        ensure_pipeline_profile_exists(payload.user_id.strip())
-        pipeline = get_pipeline(payload.user_id.strip())
-        result = pipeline.run(payload.message.strip())
+        ensure_pipeline_profile_exists(user_id)
+        pipeline = get_pipeline(user_id)
+        result = pipeline.run(message)
         return {
-            "user_id": payload.user_id.strip(),
-            "message": payload.message.strip(),
+            "user_id": user_id,
+            "message": message,
             "result": normalize_pipeline_result(result),
         }
+    except HTTPException:
+        raise
     except Exception as exc:
+        logger.exception("Pipeline failed user_id=%s", user_id)
         raise HTTPException(status_code=500, detail=f"Pipeline failed: {exc}")
 
 
@@ -509,7 +778,11 @@ def chat(payload: ChatRequest) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 @app.post("/users")
-def create_user(payload: CreateUserRequest) -> Dict[str, Any]:
+def create_user(
+    payload: CreateUserRequest,
+    x_api_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
     try:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         state = load_app_state(user_id)
@@ -529,11 +802,17 @@ def create_user(payload: CreateUserRequest) -> Dict[str, Any]:
             "timezone": state["profile"]["timezone"],
             "assistant_name": state["profile"]["assistant_name"],
         }
+    except HTTPException:
+        raise
     except Exception as exc:
+        logger.exception("Failed to create user")
         raise HTTPException(status_code=500, detail=f"Failed to create user: {exc}")
 
+
 @app.get("/users/{user_id}")
-def get_user(user_id: str) -> Dict[str, Any]:
+def get_user(user_id: str, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
+    user_id = sanitize_user_id(user_id)
     state = load_app_state(user_id)
     profile = state.get("profile", {})
     return {
@@ -544,14 +823,25 @@ def get_user(user_id: str) -> Dict[str, Any]:
         "assistant_name": profile.get("assistant_name", "Ellie"),
     }
 
+
 @app.get("/users/{user_id}/daily-routine")
-def get_daily_routine(user_id: str) -> Dict[str, Any]:
+def get_daily_routine(user_id: str, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
+    user_id = sanitize_user_id(user_id)
     state = load_app_state(user_id)
     routine = state.get("daily_routine", {})
     return {"user_id": user_id, **routine}
 
+
 @app.put("/users/{user_id}/daily-routine")
-def upsert_daily_routine(user_id: str, payload: DailyRoutineIn) -> Dict[str, Any]:
+def upsert_daily_routine(
+    user_id: str,
+    payload: DailyRoutineIn,
+    x_api_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
+    user_id = sanitize_user_id(user_id)
+
     validate_hhmm(payload.wake_time)
     validate_hhmm(payload.sleep_time)
 
@@ -574,8 +864,16 @@ def upsert_daily_routine(user_id: str, payload: DailyRoutineIn) -> Dict[str, Any
     ensure_pipeline_profile_exists(user_id)
     return {"user_id": user_id, **state["daily_routine"]}
 
+
 @app.post("/users/{user_id}/questionnaire")
-def save_mobile_questionnaire(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def save_mobile_questionnaire(
+    user_id: str,
+    payload: Dict[str, Any],
+    x_api_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
+    user_id = sanitize_user_id(user_id)
+
     raw = payload.get("payload", payload)
 
     mapped = DailyRoutineIn(
@@ -585,10 +883,13 @@ def save_mobile_questionnaire(user_id: str, payload: Dict[str, Any]) -> Dict[str
         work_end=raw.get("workEnd") or raw.get("work_end"),
         daily_habits=raw.get("dailyHabits") or raw.get("daily_habits"),
     )
-    return upsert_daily_routine(user_id, mapped)
+    return upsert_daily_routine(user_id, mapped, x_api_key=x_api_key)
+
 
 @app.get("/users/{user_id}/personality")
-def get_personality(user_id: str) -> Dict[str, Any]:
+def get_personality(user_id: str, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
+    user_id = sanitize_user_id(user_id)
     ensure_pipeline_profile_exists(user_id)
     profile = behaviour.load_profile(user_id)
     return {
@@ -596,8 +897,16 @@ def get_personality(user_id: str) -> Dict[str, Any]:
         "summary": profile.get("profile_summary", ""),
     }
 
+
 @app.post("/users/{user_id}/personality")
-def save_personality_answers(user_id: str, payload: PersonalityAnswersIn) -> Dict[str, Any]:
+def save_personality_answers(
+    user_id: str,
+    payload: PersonalityAnswersIn,
+    x_api_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
+    user_id = sanitize_user_id(user_id)
+
     state = load_app_state(user_id)
     existing = behaviour.load_profile(user_id) if behaviour.profile_exists(user_id) else None
     profile = build_profile_from_answers(
@@ -610,13 +919,17 @@ def save_personality_answers(user_id: str, payload: PersonalityAnswersIn) -> Dic
     reset_pipeline(user_id)
     return {"ok": True, "profile": profile}
 
+
 @app.post("/users/{user_id}/generate-daily-checkins")
-def generate_daily_checkins(user_id: str) -> Dict[str, Any]:
+def generate_daily_checkins(user_id: str, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
+    user_id = sanitize_user_id(user_id)
     try:
         return generate_daily_checkins_with_llm(user_id)
     except HTTPException:
         raise
     except Exception as exc:
+        logger.exception("Failed to generate daily check-ins user_id=%s", user_id)
         raise HTTPException(status_code=500, detail=f"Failed to generate daily check-ins: {exc}")
 
 
@@ -625,12 +938,17 @@ def generate_daily_checkins(user_id: str) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 @app.post("/parse-datetime")
-def parse_datetime(payload: ParseDatetimeRequest) -> Dict[str, Any]:
+def parse_datetime(
+    payload: ParseDatetimeRequest,
+    x_api_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
     try:
         return parse_datetime_with_llm(payload.text, payload.timezone, payload.now_iso)
     except HTTPException:
         raise
     except Exception as exc:
+        logger.exception("Failed to parse datetime")
         raise HTTPException(status_code=500, detail=f"Failed to parse datetime: {exc}")
 
 
@@ -642,12 +960,24 @@ def parse_datetime(payload: ParseDatetimeRequest) -> Dict[str, Any]:
 async def transcribe_and_analyze(
     file: UploadFile = File(...),
     user_id: Optional[str] = Query(default=None),
+    x_api_key: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
+    verify_api_key(x_api_key)
     client = require_openai()
+
+    final_user_id = sanitize_user_id(user_id or "guest_user")
 
     suffix = os.path.splitext(file.filename or "")[-1] or ".m4a"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
+        total_bytes = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_AUDIO_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Audio file too large")
+            tmp.write(chunk)
         tmp_path = tmp.name
 
     try:
@@ -660,27 +990,38 @@ async def transcribe_and_analyze(
             )
 
         transcript_text = getattr(transcript_obj, "text", "") or ""
-        if not transcript_text.strip():
+        transcript_text = transcript_text.strip()
+        if not transcript_text:
             raise HTTPException(status_code=400, detail="Could not transcribe audio.")
 
-        if not user_id:
-            user_id = "guest_user"
-
-        ensure_pipeline_profile_exists(user_id)
-        pipeline = get_pipeline(user_id)
-        result = pipeline.run(transcript_text.strip())
+        ensure_pipeline_profile_exists(final_user_id)
+        pipeline = get_pipeline(final_user_id)
+        result = pipeline.run(transcript_text)
 
         return {
-            "user_id": user_id,
-            "message": transcript_text.strip(),
+            "user_id": final_user_id,
+            "message": transcript_text,
             "result": normalize_pipeline_result(result),
         }
     except HTTPException:
         raise
     except Exception as exc:
+        logger.exception("Voice pipeline failed user_id=%s", final_user_id)
         raise HTTPException(status_code=500, detail=f"Voice pipeline failed: {exc}")
     finally:
         try:
             os.remove(tmp_path)
         except Exception:
             pass
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    logger.info(
+        "Starting service=%s version=%s debug=%s docs_enabled=%s openai_configured=%s",
+        APP_NAME,
+        PIPELINE_VERSION,
+        DEBUG,
+        API_DOCS_ENABLED,
+        bool(OPENAI_API_KEY and openai_client is not None),
+    )
