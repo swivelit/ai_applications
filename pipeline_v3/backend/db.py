@@ -8,7 +8,12 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from config import APP_STATE_MAX_BYTES, DB_PATH, SESSION_TTL_DAYS
+from config import (
+    ACCESS_TOKEN_TTL_MINUTES,
+    APP_STATE_MAX_BYTES,
+    DB_PATH,
+    REFRESH_TOKEN_TTL_DAYS,
+)
 
 _WRITE_LOCK = threading.Lock()
 
@@ -36,6 +41,14 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
+
+
+def _hash_token(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+def _new_raw_token() -> str:
+    return secrets.token_urlsafe(32)
 
 
 def init_db() -> None:
@@ -68,6 +81,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sessions (
                 token_hash TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
+                token_type TEXT NOT NULL,
+                parent_token_hash TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
@@ -78,6 +93,8 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_type ON sessions(token_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_token_hash)")
 
 
 def db_ready() -> bool:
@@ -157,30 +174,71 @@ def get_app_state(user_id: str) -> Optional[Dict[str, Any]]:
     return json.loads(row["state_json"])
 
 
-def _hash_token(raw_token: str) -> str:
-    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
-
-
-def create_session(user_id: str, *, ttl_days: int = SESSION_TTL_DAYS) -> Dict[str, str]:
-    raw_token = secrets.token_urlsafe(32)
+def _insert_session(
+    user_id: str,
+    *,
+    token_type: str,
+    ttl_seconds: int,
+    parent_token_hash: Optional[str] = None,
+) -> Dict[str, str]:
+    raw_token = _new_raw_token()
     token_hash = _hash_token(raw_token)
     now = utc_now()
-    expires_at = (now + timedelta(days=ttl_days)).replace(microsecond=0)
+    expires_at = (now + timedelta(seconds=ttl_seconds)).replace(microsecond=0)
+
     now_iso = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     expires_iso = expires_at.isoformat().replace("+00:00", "Z")
 
-    with _WRITE_LOCK, _connect() as conn:
+    with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO sessions (token_hash, user_id, created_at, updated_at, expires_at, is_revoked)
-            VALUES (?, ?, ?, ?, ?, 0)
+            INSERT INTO sessions (
+                token_hash, user_id, token_type, parent_token_hash,
+                created_at, updated_at, expires_at, is_revoked
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
             """,
-            (token_hash, user_id, now_iso, now_iso, expires_iso),
+            (
+                token_hash,
+                user_id,
+                token_type,
+                parent_token_hash,
+                now_iso,
+                now_iso,
+                expires_iso,
+            ),
         )
 
     return {
-        "access_token": raw_token,
+        "token": raw_token,
+        "token_hash": token_hash,
         "expires_at": expires_iso,
+    }
+
+
+def create_session_pair(
+    user_id: str,
+    *,
+    access_ttl_minutes: int = ACCESS_TOKEN_TTL_MINUTES,
+    refresh_ttl_days: int = REFRESH_TOKEN_TTL_DAYS,
+) -> Dict[str, str]:
+    refresh = _insert_session(
+        user_id,
+        token_type="refresh",
+        ttl_seconds=refresh_ttl_days * 24 * 60 * 60,
+    )
+    access = _insert_session(
+        user_id,
+        token_type="access",
+        ttl_seconds=access_ttl_minutes * 60,
+        parent_token_hash=refresh["token_hash"],
+    )
+
+    return {
+        "access_token": access["token"],
+        "access_expires_at": access["expires_at"],
+        "refresh_token": refresh["token"],
+        "refresh_expires_at": refresh["expires_at"],
     }
 
 
@@ -189,7 +247,8 @@ def get_session_by_token(raw_token: str) -> Optional[Dict[str, Any]]:
     with _connect() as conn:
         row = conn.execute(
             """
-            SELECT token_hash, user_id, created_at, updated_at, expires_at, is_revoked
+            SELECT token_hash, user_id, token_type, parent_token_hash,
+                   created_at, updated_at, expires_at, is_revoked
             FROM sessions
             WHERE token_hash = ?
             """,
@@ -215,6 +274,22 @@ def revoke_session(raw_token: str) -> None:
             "UPDATE sessions SET is_revoked = 1 WHERE token_hash = ?",
             (token_hash,),
         )
+        conn.execute(
+            "UPDATE sessions SET is_revoked = 1 WHERE parent_token_hash = ?",
+            (token_hash,),
+        )
+
+
+def revoke_session_by_hash(token_hash: str) -> None:
+    with _WRITE_LOCK, _connect() as conn:
+        conn.execute(
+            "UPDATE sessions SET is_revoked = 1 WHERE token_hash = ?",
+            (token_hash,),
+        )
+        conn.execute(
+            "UPDATE sessions SET is_revoked = 1 WHERE parent_token_hash = ?",
+            (token_hash,),
+        )
 
 
 def revoke_all_sessions_for_user(user_id: str) -> None:
@@ -225,9 +300,17 @@ def revoke_all_sessions_for_user(user_id: str) -> None:
         )
 
 
-def rotate_session(raw_token: str, *, ttl_days: int = SESSION_TTL_DAYS) -> Optional[Dict[str, str]]:
-    session = get_session_by_token(raw_token)
+def rotate_refresh_session(
+    raw_refresh_token: str,
+    *,
+    access_ttl_minutes: int = ACCESS_TOKEN_TTL_MINUTES,
+    refresh_ttl_days: int = REFRESH_TOKEN_TTL_DAYS,
+) -> Optional[Dict[str, str]]:
+    session = get_session_by_token(raw_refresh_token)
     if not session:
+        return None
+
+    if session["token_type"] != "refresh":
         return None
 
     if int(session.get("is_revoked") or 0) == 1:
@@ -238,15 +321,19 @@ def rotate_session(raw_token: str, *, ttl_days: int = SESSION_TTL_DAYS) -> Optio
         return None
 
     user_id = str(session["user_id"])
+    old_refresh_hash = str(session["token_hash"])
 
     with _WRITE_LOCK:
-        revoke_session(raw_token)
-        new_session = create_session(user_id, ttl_days=ttl_days)
+        revoke_session_by_hash(old_refresh_hash)
+        new_pair = create_session_pair(
+            user_id,
+            access_ttl_minutes=access_ttl_minutes,
+            refresh_ttl_days=refresh_ttl_days,
+        )
 
     return {
         "user_id": user_id,
-        "access_token": new_session["access_token"],
-        "expires_at": new_session["expires_at"],
+        **new_pair,
     }
 
 

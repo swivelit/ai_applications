@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from config import (
+    ACCESS_TOKEN_TTL_MINUTES,
     API_CORS_ORIGINS,
     API_DOCS_ENABLED,
     API_KEY,
@@ -35,10 +36,11 @@ from config import (
     OPENAI_MODEL,
     OPENAI_TIMEOUT,
     PIPELINE_VERSION,
+    REFRESH_TOKEN_TTL_DAYS,
 )
 from db import (
     create_or_replace_user,
-    create_session,
+    create_session_pair,
     db_ready,
     get_app_state as db_get_app_state,
     get_session_by_token,
@@ -48,7 +50,7 @@ from db import (
     prune_expired_sessions,
     revoke_all_sessions_for_user,
     revoke_session,
-    rotate_session,
+    rotate_refresh_session,
     save_app_state as db_save_app_state,
     touch_session,
 )
@@ -145,11 +147,13 @@ class PersonalityAnswersIn(BaseModel):
     answers: Dict[str, Any]
 
 
-class SessionRefreshResponse(BaseModel):
+class SessionIssueResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     access_token: str
+    access_expires_at: str
+    refresh_token: str
+    refresh_expires_at: str
     token_type: str
-    expires_at: str
     user_id: str
 
 
@@ -518,6 +522,9 @@ def require_auth_user(
     if not session or int(session.get("is_revoked") or 0) == 1:
         raise HTTPException(status_code=401, detail="Invalid session")
 
+    if str(session.get("token_type")) != "access":
+        raise HTTPException(status_code=401, detail="Access token required")
+
     expires_at = parse_utc_iso(str(session["expires_at"]))
     if expires_at <= datetime.now(timezone.utc):
         raise HTTPException(status_code=401, detail="Session expired")
@@ -658,20 +665,26 @@ def ready() -> Dict[str, Any]:
     }
 
 
-@app.post("/auth/refresh", response_model=SessionRefreshResponse)
+@app.post("/auth/refresh", response_model=SessionIssueResponse)
 def refresh_session(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    raw_token = _extract_bearer_token(authorization)
-    if not raw_token:
+    raw_refresh_token = _extract_bearer_token(authorization)
+    if not raw_refresh_token:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    rotated = rotate_session(raw_token)
+    rotated = rotate_refresh_session(
+        raw_refresh_token,
+        access_ttl_minutes=ACCESS_TOKEN_TTL_MINUTES,
+        refresh_ttl_days=REFRESH_TOKEN_TTL_DAYS,
+    )
     if not rotated:
-        raise HTTPException(status_code=401, detail="Invalid or expired session")
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
     return {
         "access_token": rotated["access_token"],
+        "access_expires_at": rotated["access_expires_at"],
+        "refresh_token": rotated["refresh_token"],
+        "refresh_expires_at": rotated["refresh_expires_at"],
         "token_type": "bearer",
-        "expires_at": rotated["expires_at"],
         "user_id": rotated["user_id"],
     }
 
@@ -751,7 +764,11 @@ def create_user(payload: CreateUserRequest) -> Dict[str, Any]:
         save_app_state(user_id, state)
         ensure_pipeline_profile_exists(user_id)
 
-        session = create_session(user_id)
+        session_pair = create_session_pair(
+            user_id,
+            access_ttl_minutes=ACCESS_TOKEN_TTL_MINUTES,
+            refresh_ttl_days=REFRESH_TOKEN_TTL_DAYS,
+        )
 
         return {
             "id": user_id,
@@ -759,9 +776,11 @@ def create_user(payload: CreateUserRequest) -> Dict[str, Any]:
             "place": state["profile"]["place"],
             "timezone": state["profile"]["timezone"],
             "assistant_name": state["profile"]["assistant_name"],
-            "access_token": session["access_token"],
+            "access_token": session_pair["access_token"],
+            "access_expires_at": session_pair["access_expires_at"],
+            "refresh_token": session_pair["refresh_token"],
+            "refresh_expires_at": session_pair["refresh_expires_at"],
             "token_type": "bearer",
-            "expires_at": session["expires_at"],
         }
     except HTTPException:
         raise

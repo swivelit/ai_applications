@@ -124,7 +124,6 @@ API_HOST = _env_str("API_HOST", "0.0.0.0")
 API_PORT = _env_int("API_PORT", 8000, minimum=1)
 API_DOCS_ENABLED = _env_bool("API_DOCS_ENABLED", True)
 
-# Optional admin/service key. Do NOT rely on this for end-user auth.
 API_KEY = _env_str("API_KEY", "")
 API_CORS_ORIGINS = _env_csv("API_CORS_ORIGINS", "http://localhost:3000,http://localhost:8081")
 API_RATE_LIMIT_REQUESTS = _env_int("API_RATE_LIMIT_REQUESTS", 60, minimum=1)
@@ -134,7 +133,8 @@ MAX_MESSAGE_CHARS = _env_int("MAX_MESSAGE_CHARS", 4000, minimum=100)
 MAX_AUDIO_UPLOAD_BYTES = _env_int("MAX_AUDIO_UPLOAD_BYTES", 12 * 1024 * 1024, minimum=1024)
 APP_STATE_MAX_BYTES = _env_int("APP_STATE_MAX_BYTES", 256 * 1024, minimum=1024)
 
-SESSION_TTL_DAYS = _env_int("SESSION_TTL_DAYS", 90, minimum=1)
+ACCESS_TOKEN_TTL_MINUTES = _env_int("ACCESS_TOKEN_TTL_MINUTES", 20, minimum=5)
+REFRESH_TOKEN_TTL_DAYS = _env_int("REFRESH_TOKEN_TTL_DAYS", 90, minimum=1)
 
 PREGNANCY_CUSTOM_AVOID_LIST = [
     "pineapple",

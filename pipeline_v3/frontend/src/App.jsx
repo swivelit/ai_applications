@@ -1,18 +1,28 @@
 import { useEffect, useMemo, useState } from "react";
-import { getProfile, getQuestions, resetProfile, saveProfile, sendChat } from "./api";
+import {
+  createUser,
+  ensureSession,
+  getCurrentSession,
+  getProfile,
+  getQuestions,
+  logoutSession,
+  resetProfile,
+  saveProfile,
+  sendChat,
+} from "./api";
 
 const starterSuggestions = [
   "Schedule a meeting",
   "Schedule a birthday",
   "Schedule an event",
-  "Ask me anything"
+  "Ask me anything",
 ];
 
 const mockScheduleItems = [
   { id: 1, title: "Team Meeting", time: "Today • 10:00 AM", status: "scheduled" },
   { id: 2, title: "Event", time: "Today • 3:00 PM", status: "scheduled" },
   { id: 3, title: "Mom Birthday", time: "Tomorrow • 9:00 AM", status: "pending" },
-  { id: 4, title: "Project Review", time: "Mon • 11:30 AM", status: "scheduled" }
+  { id: 4, title: "Project Review", time: "Mon • 11:30 AM", status: "scheduled" },
 ];
 
 function MenuIcon() {
@@ -49,21 +59,21 @@ function HistoryRail({ history, activeScreen, setActiveScreen, userId }) {
         <button className="mini-icon-btn">✎</button>
       </div>
 
-      <div className="history-section-title">My History</div>
+      <div className="history-section-title">Recent chats</div>
 
       <div className="history-list">
         {history.length === 0 ? (
-          <div className="history-empty">No conversations yet</div>
+          <div className="history-empty">No conversations yet.</div>
         ) : (
-          history.map((item, index) => (
+          history.map((entry, index) => (
             <button
-              key={`${item.message}-${index}`}
+              key={`${entry.message}-${index}`}
               className="history-item"
               onClick={() => setActiveScreen("chat")}
             >
-              <div className="history-item-title">{item.message}</div>
+              <div className="history-item-title">{entry.message}</div>
               <div className="history-item-subtitle">
-                {(item.result?.theni_tamil_text || "").slice(0, 40) || "Recent response"}
+                {entry.result?.route_taken || "response"}
               </div>
             </button>
           ))
@@ -71,12 +81,23 @@ function HistoryRail({ history, activeScreen, setActiveScreen, userId }) {
       </div>
 
       <div className="history-footer">
-        <button className="rail-footer-btn">⚙ Setting</button>
+        <button className="rail-footer-btn" onClick={() => setActiveScreen("home")}>
+          Home
+        </button>
+        <button className="rail-footer-btn" onClick={() => setActiveScreen("chat")}>
+          Chat
+        </button>
+        <button className="rail-footer-btn" onClick={() => setActiveScreen("schedule")}>
+          Schedule
+        </button>
+
         <div className="profile-mini-card">
-          <div className="profile-avatar-small">A</div>
-          <div className="profile-mini-meta">
-            <div className="profile-mini-name">{userId || "demo_user"}</div>
-            <div className="profile-mini-sub">Voice Assistant</div>
+          <div className="profile-avatar-small">
+            {(userId || "U").slice(0, 1).toUpperCase()}
+          </div>
+          <div>
+            <div className="profile-mini-name">{userId || "loading..."}</div>
+            <div className="profile-mini-sub">Authenticated session</div>
           </div>
           <div className="profile-mini-badge">v1.0</div>
         </div>
@@ -218,14 +239,12 @@ function ScheduleScreen({ onBack }) {
         <button className="filter-chip">Birthdays</button>
       </div>
 
-      <div className="schedule-list">
+      <div className="schedule-card-stack">
         {mockScheduleItems.map((item) => (
           <div key={item.id} className="schedule-card">
-            <div className="schedule-card-left">
-              <div className="schedule-card-title">{item.title}</div>
-              <div className="schedule-card-time">{item.time}</div>
-            </div>
-            <div className={`schedule-status ${item.status}`}>{item.status}</div>
+            <div className="schedule-card-title">{item.title}</div>
+            <div className="schedule-card-time">{item.time}</div>
+            <div className={`status-pill ${item.status}`}>{formatLabel(item.status)}</div>
           </div>
         ))}
       </div>
@@ -236,31 +255,75 @@ function ScheduleScreen({ onBack }) {
 function VoiceScreen({ onBack }) {
   return (
     <div className="mobile-screen">
-      <div className="topbar">
+      <div className="topbar left-compact">
         <button className="icon-btn" onClick={onBack}>
           <BackIcon />
         </button>
-        <div className="brand-title">Seyalvel AI</div>
-        <button className="icon-btn">
-          <RefreshIcon />
-        </button>
+        <div className="screen-title">Voice</div>
       </div>
 
-      <div className="screen-body center-layout voice-layout">
-        <OrbCenter subtitle="" title="" />
-        <div className="voice-hint">Tap here to talk</div>
-      </div>
-
-      <div className="voice-bar-wrap">
-        <button className="voice-side-btn">‹</button>
-        <div className="voice-waveform">
-          <span></span><span></span><span></span><span></span><span></span>
-          <span></span><span></span><span></span><span></span><span></span>
+      <div className="screen-body center-layout">
+        <div className="voice-shell">
+          <div className="voice-wave-ring"></div>
+          <div className="voice-wave-ring ring-2"></div>
+          <div className="voice-core">
+            <VoiceIcon />
+          </div>
+          <div className="voice-label">Voice capture coming next</div>
         </div>
-        <button className="voice-side-btn">
-          <VoiceIcon />
-        </button>
       </div>
+    </div>
+  );
+}
+
+function QuestionCard({ question, value, onChange }) {
+  const { id, question_text, type, options = [] } = question;
+
+  return (
+    <div className="question-card">
+      <div className="question-title">{question_text}</div>
+
+      {type === "single" ? (
+        <div className="option-grid">
+          {options.map((option) => (
+            <button
+              key={option.value}
+              className={`option-pill ${value === option.value ? "selected" : ""}`}
+              onClick={() => onChange(id, option.value)}
+            >
+              {formatLabel(option.label || option.value)}
+            </button>
+          ))}
+        </div>
+      ) : type === "multi" ? (
+        <div className="option-grid">
+          {options.map((option) => {
+            const selected = Array.isArray(value) && value.includes(option.value);
+            return (
+              <button
+                key={option.value}
+                className={`option-pill ${selected ? "selected" : ""}`}
+                onClick={() => {
+                  const current = Array.isArray(value) ? value : [];
+                  const next = selected
+                    ? current.filter((item) => item !== option.value)
+                    : [...current, option.value];
+                  onChange(id, next);
+                }}
+              >
+                {formatLabel(option.label || option.value)}
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        <input
+          className="text-answer-input"
+          value={value || ""}
+          onChange={(e) => onChange(id, e.target.value)}
+          placeholder="Type your answer"
+        />
+      )}
     </div>
   );
 }
@@ -276,192 +339,120 @@ function QuestionnairePanel({
   onSaveProfile,
   onResetProfile,
   profileLoading,
-  profileSaving
+  profileSaving,
 }) {
+  function handleAnswerChange(id, value) {
+    setAnswers((prev) => ({ ...prev, [id]: value }));
+  }
+
   return (
     <section className="dashboard-panel">
-      <div className="dashboard-panel-header">
-        <h2>Profile Setup</h2>
-        <div className="dashboard-panel-subtitle">
-          Save the assistant behavior for each user.
+      <div className="panel-header">
+        <div>
+          <div className="panel-kicker">Questionnaire</div>
+          <h2>Behavior profile</h2>
+          <div className="panel-sub">
+            Authenticated user: <strong>{userId || "-"}</strong>
+          </div>
+        </div>
+
+        <div className="panel-actions">
+          <button className="primary-btn soft" onClick={onLoadProfile} disabled={profileLoading}>
+            {profileLoading ? "Loading..." : "Load"}
+          </button>
+          <button className="primary-btn" onClick={onSaveProfile} disabled={profileSaving}>
+            {profileSaving ? "Saving..." : "Save"}
+          </button>
+          <button className="danger-btn" onClick={onResetProfile}>
+            Reset
+          </button>
         </div>
       </div>
 
-      <div className="profile-status-row">
-        <div className="profile-status-card">
-          <div className="status-kicker">User</div>
-          <div className="status-main">{userId}</div>
+      {profileExists ? (
+        <div className="profile-banner success">
+          Saved profile loaded. {profileSummary ? `Summary: ${profileSummary}` : ""}
         </div>
-        <div className="profile-status-card">
-          <div className="status-kicker">Profile</div>
-          <div className="status-main">{profileExists ? "Saved" : "Not saved"}</div>
+      ) : (
+        <div className="profile-banner">
+          No saved profile yet for this authenticated user.
         </div>
-      </div>
+      )}
 
-      <div className="panel-actions">
-        <button className="dashboard-btn secondary" onClick={onLoadProfile} disabled={profileLoading}>
-          {profileLoading ? "Loading..." : "Load Profile"}
-        </button>
-        <button className="dashboard-btn primary" onClick={onSaveProfile} disabled={profileSaving}>
-          {profileSaving ? "Saving..." : "Save Profile"}
-        </button>
-        <button className="dashboard-btn danger" onClick={onResetProfile}>
-          Reset
-        </button>
-      </div>
-
-      {profileSummary ? <div className="summary-panel">{profileSummary}</div> : null}
-
-      <div className="questions-grid">
-        {questions.map((question) => {
-          const value = answers[question.id];
-
-          if (question.type === "single") {
-            return (
-              <div className="question-box" key={question.id}>
-                <div className="question-label">{question.prompt}</div>
-                <select
-                  className="dashboard-select"
-                  value={value || ""}
-                  onChange={(e) =>
-                    setAnswers((prev) => ({
-                      ...prev,
-                      [question.id]: e.target.value
-                    }))
-                  }
-                >
-                  <option value="">Select</option>
-                  {question.options.map((option) => (
-                    <option key={option} value={option}>
-                      {formatLabel(option)}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            );
-          }
-
-          const selected = Array.isArray(value) ? value : [];
-
-          return (
-            <div className="question-box" key={question.id}>
-              <div className="question-label">{question.prompt}</div>
-              <div className="multi-options">
-                {question.options.map((option) => {
-                  const checked = selected.includes(option);
-                  return (
-                    <label className={`multi-chip ${checked ? "checked" : ""}`} key={option}>
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={(e) => {
-                          let next = [...selected];
-
-                          if (e.target.checked) {
-                            if (!next.includes(option)) next.push(option);
-                          } else {
-                            next = next.filter((item) => item !== option);
-                          }
-
-                          if (question.max_choices && next.length > question.max_choices) {
-                            next = next.slice(0, question.max_choices);
-                          }
-
-                          if (next.includes("none") && next.length > 1) {
-                            next = ["none"];
-                          }
-
-                          setAnswers((prev) => ({
-                            ...prev,
-                            [question.id]: next
-                          }));
-                        }}
-                      />
-                      <span>{formatLabel(option)}</span>
-                    </label>
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
+      <div className="question-grid">
+        {questions.map((question) => (
+          <QuestionCard
+            key={question.id}
+            question={question}
+            value={answers[question.id]}
+            onChange={handleAnswerChange}
+          />
+        ))}
       </div>
     </section>
   );
 }
 
 function ResultPanel({ latestResult }) {
-  if (!latestResult) {
-    return (
-      <section className="dashboard-panel">
-        <div className="dashboard-panel-header">
-          <h2>Latest Result</h2>
-          <div className="dashboard-panel-subtitle">
-            The newest pipeline output will appear here.
-          </div>
-        </div>
-        <div className="empty-results">No response yet.</div>
-      </section>
-    );
-  }
-
   return (
     <section className="dashboard-panel">
-      <div className="dashboard-panel-header">
-        <h2>Latest Result</h2>
-        <div className="dashboard-panel-subtitle">
-          Backend response from your persona pipeline.
+      <div className="panel-header">
+        <div>
+          <div className="panel-kicker">Inference</div>
+          <h2>Latest output</h2>
         </div>
       </div>
 
-      <div className="result-stat-grid">
-        <div className="result-stat"><span>Route</span><strong>{latestResult.route_taken || "-"}</strong></div>
-        <div className="result-stat"><span>Risk</span><strong>{latestResult.risk_level || "-"}</strong></div>
-        <div className="result-stat"><span>Label</span><strong>{latestResult.predicted_label || "-"}</strong></div>
-        <div className="result-stat"><span>Cache</span><strong>{String(latestResult.cache_hit || "-")}</strong></div>
-      </div>
+      {!latestResult ? (
+        <div className="empty-result-state">
+          Send a message to see the pipeline output here.
+        </div>
+      ) : (
+        <>
+          <div className="result-grid">
+            <div className="result-pane">
+              <h3>Raw English</h3>
+              <p>{latestResult.raw_english || "-"}</p>
+            </div>
+            <div className="result-pane">
+              <h3>Remodeled English</h3>
+              <p>{latestResult.remodeled_english || "-"}</p>
+            </div>
+            <div className="result-pane">
+              <h3>Standard Tamil</h3>
+              <p>{latestResult.tamil_text || "-"}</p>
+            </div>
+            <div className="result-pane highlight">
+              <h3>Theni Tamil</h3>
+              <p>{latestResult.theni_tamil_text || "-"}</p>
+            </div>
+          </div>
 
-      <div className="result-cards">
-        <div className="result-pane">
-          <h3>Raw English</h3>
-          <p>{latestResult.raw_english || "-"}</p>
-        </div>
-        <div className="result-pane">
-          <h3>Remodeled English</h3>
-          <p>{latestResult.remodeled_english || "-"}</p>
-        </div>
-        <div className="result-pane">
-          <h3>Standard Tamil</h3>
-          <p>{latestResult.tamil_text || "-"}</p>
-        </div>
-        <div className="result-pane highlight">
-          <h3>Theni Tamil</h3>
-          <p>{latestResult.theni_tamil_text || "-"}</p>
-        </div>
-      </div>
-
-      <div className="debug-panels">
-        <div className="debug-panel">
-          <h4>Stage Notes</h4>
-          <pre>{JSON.stringify(latestResult.stage_notes || [], null, 2)}</pre>
-        </div>
-        <div className="debug-panel">
-          <h4>Timings</h4>
-          <pre>{JSON.stringify(latestResult.timings_ms || {}, null, 2)}</pre>
-        </div>
-      </div>
+          <div className="debug-panels">
+            <div className="debug-panel">
+              <h4>Stage Notes</h4>
+              <pre>{JSON.stringify(latestResult.stage_notes || [], null, 2)}</pre>
+            </div>
+            <div className="debug-panel">
+              <h4>Timings</h4>
+              <pre>{JSON.stringify(latestResult.timings_ms || {}, null, 2)}</pre>
+            </div>
+          </div>
+        </>
+      )}
     </section>
   );
 }
 
 export default function App() {
-  const [userId, setUserId] = useState("demo_user");
+  const [userId, setUserId] = useState("");
   const [questions, setQuestions] = useState([]);
   const [answers, setAnswers] = useState({});
   const [profile, setProfile] = useState(null);
   const [profileExists, setProfileExists] = useState(false);
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileSaving, setProfileSaving] = useState(false);
+  const [sessionLoading, setSessionLoading] = useState(true);
 
   const [activeScreen, setActiveScreen] = useState("home");
   const [message, setMessage] = useState("");
@@ -471,20 +462,54 @@ export default function App() {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    async function loadQuestions() {
+    async function boot() {
       try {
-        const res = await getQuestions();
-        setQuestions(res.questions || []);
+        setError("");
+        const session = await ensureSession();
+        setUserId(session.userId);
+
+        const [questionsRes, sessionRes] = await Promise.all([
+          getQuestions(),
+          getCurrentSession(),
+        ]);
+
+        setQuestions(questionsRes.questions || []);
+        if (sessionRes?.userId && !userId) {
+          setUserId(sessionRes.userId);
+        }
       } catch (err) {
-        setError(err.message);
+        setError(err.message || "Failed to initialize app");
+      } finally {
+        setSessionLoading(false);
       }
     }
-    loadQuestions();
+
+    boot();
   }, []);
+
+  async function handleStartFreshSession() {
+    try {
+      setError("");
+      setSessionLoading(true);
+      await logoutSession().catch(() => {});
+      const session = await createUser();
+      setUserId(session.userId);
+      setProfile(null);
+      setProfileExists(false);
+      setAnswers({});
+      setChatResult(null);
+      setChatHistory([]);
+      setActiveScreen("home");
+    } catch (err) {
+      setError(err.message || "Failed to create new session");
+    } finally {
+      setSessionLoading(false);
+    }
+  }
 
   async function loadProfile() {
     if (!userId.trim()) {
-      setError("Enter a user id first");
+      setError("Authenticated user is missing");
       return;
     }
 
@@ -504,7 +529,7 @@ export default function App() {
 
   async function handleSaveProfile() {
     if (!userId.trim()) {
-      setError("Enter a user id first");
+      setError("Authenticated user is missing");
       return;
     }
 
@@ -523,7 +548,7 @@ export default function App() {
 
   async function handleResetProfile() {
     if (!userId.trim()) {
-      setError("Enter a user id first");
+      setError("Authenticated user is missing");
       return;
     }
 
@@ -544,7 +569,7 @@ export default function App() {
     e?.preventDefault?.();
 
     if (!userId.trim()) {
-      setError("Enter a user id first");
+      setError("Authenticated user is missing");
       return;
     }
 
@@ -608,6 +633,26 @@ export default function App() {
     );
   }
 
+  if (sessionLoading) {
+    return (
+      <div className="app-shell">
+        <main className="workspace" style={{ gridTemplateColumns: "1fr" }}>
+          <section className="dashboard-stage">
+            <div className="dashboard-panel">
+              <div className="panel-header">
+                <div>
+                  <div className="panel-kicker">Initializing</div>
+                  <h2>Preparing authenticated session</h2>
+                </div>
+              </div>
+              <div className="loading-banner">Starting app...</div>
+            </div>
+          </section>
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       <HistoryRail
@@ -632,13 +677,38 @@ export default function App() {
             </div>
 
             <div className="dashboard-user-input">
-              <label>User ID</label>
-              <input
-                value={userId}
-                onChange={(e) => setUserId(e.target.value)}
-                placeholder="demo_user"
-              />
+              <label>Authenticated User ID</label>
+              <input value={userId} readOnly />
             </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+            <button className="primary-btn soft" onClick={handleStartFreshSession}>
+              New session
+            </button>
+            <button
+              className="danger-btn"
+              onClick={async () => {
+                await logoutSession();
+                setUserId("");
+                setProfile(null);
+                setProfileExists(false);
+                setAnswers({});
+                setChatResult(null);
+                setChatHistory([]);
+                setSessionLoading(true);
+                try {
+                  const session = await ensureSession();
+                  setUserId(session.userId);
+                } catch (err) {
+                  setError(err.message || "Failed to recover session");
+                } finally {
+                  setSessionLoading(false);
+                }
+              }}
+            >
+              Logout
+            </button>
           </div>
 
           {error ? <div className="error-banner">{error}</div> : null}
